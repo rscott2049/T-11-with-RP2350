@@ -1,0 +1,44 @@
+GAS LISTING hellopdp.s 			page 1
+Say hello on console
+
+   1              	    .TITLE Say hello on console
+   2              	        .IDENT "V00.00"
+   3              	
+   4              	        .GLOBAL start
+   5              	        .GLOBAL _putconch
+   6              	
+   7              	        STACK = 0x1000
+   8              	
+   9              	        .text
+  10              	start:
+  11 0000 C6150010 	        mov     $STACK, sp
+  12 0004 C1152000 	        mov     $hellom, r1
+  13 0008 C2150C00 	        mov     $helloc, r2
+  14 000c 4092     	10$:    movb    (r1), r0
+  15 000e F709EEFF 	        jsr     pc, _putconch
+  16 0012 C20A     	        dec     r2
+  17 0014 0303     	        beq     99$
+  18 0016 810A     	        inc     r1
+  19 0018 7700F0FF 	        jmp     10$
+  20              	
+  21 001c A000     	99$:    nop
+  22 001e 0000     	        halt
+  23              	
+  24              	        .data
+  25 0000 48656C6C 	hellom: .ascii  "Hello world!"
+  25      6F20776F 
+  25      726C6421 
+  26              	        helloc = . - hellom
+  27              	
+  28              	        .end                      
+GAS LISTING hellopdp.s 			page 2
+Say hello on console
+
+DEFINED SYMBOLS
+          hellopdp.s:10     .text:00000000 start
+          hellopdp.s:7      *ABS*:00001000 STACK
+          hellopdp.s:25     .data:00000000 hellom
+                            *ABS*:0000000c helloc
+
+UNDEFINED SYMBOLS
+_putconch

@@ -1,0 +1,2200 @@
+/**
+ * Initial T-11 board tests
+ */
+
+#include <stdio.h>
+#include "pico/stdlib.h"
+#include "pico/multicore.h"
+#include "hardware/clocks.h"
+#include "hardware/vreg.h"
+#include "hardware/gpio.h"
+#include "hardware/pwm.h"
+#include "hardware/pio.h"
+#include "hardware/dma.h"
+#include "hardware/structs/padsbank0.h"
+#include "hardware/structs/pio.h"
+#include "hardware/regs/pio.h"
+#include "hardware/irq.h"
+#include "hardware/sync.h"
+// SD card support
+#include "hw_config.h"
+#include "f_util.h"
+#include "ff.h"
+
+// Devices
+#include "rl02.h"
+
+// PDP-11 code lives here
+#include "lda_file.h"
+
+// T-11 boot ROM code lives here
+#include "boot_rom.h"
+
+// M9312 ROM console code lives here
+#include "m9312_console_mod.h"
+#include "m9312_rom1.h"
+#include "m9312_rom2.h"
+
+// simh RL02 boot code
+#include "simh_boot_rl02.h"
+
+// Absolute Loader format loader routine
+#include "load_lda.h"
+
+// RP2350 pin utilization for T11 control 
+#include "t11_defines.h"
+
+PIO pio;
+uint sm_bclr, sm_op, sm_iack, sm_io;
+int offset_bclr, offset_op, offset_iack, offset_io;
+#include "t11_bus.pio.h"
+#include "la.pio.h"
+
+// Emulated memory
+#define MEM_MAX 32768
+
+volatile uint16_t emu_mem[MEM_MAX] __attribute__((aligned(MEM_MAX * 2)));
+
+// Flag from DL11 emu to signal disk operation to be performed
+volatile uint32_t rl11_cs_hit = 0;
+volatile uint32_t rl11_cs_go = 0;
+
+
+
+volatile uint32_t t11_rd_addr[32];
+
+// Do initial clock and gpio setup
+void setup(void) {
+
+  // Allocate power pin, leave in OFF state
+  gpio_init(VCC_EN_PIN);
+  gpio_put(VCC_EN_PIN, 0);
+  gpio_set_dir(VCC_EN_PIN, GPIO_OUT);
+
+  // Setup a 7.5 MHz clock
+  gpio_set_function(T11_CLK_PIN, GPIO_FUNC_PWM);
+  uint slice_num = pwm_gpio_to_slice_num(T11_CLK_PIN);
+
+  // Use system clock for PWM clock
+  pwm_set_clkdiv_int_frac(slice_num, 1, 0);
+
+  // Divide by 20
+  pwm_set_wrap(slice_num, 19);
+
+  // Set 50% duty cycle
+  uint channel = pwm_gpio_to_channel(T11_CLK_PIN);
+  pwm_set_chan_level(slice_num, channel, 10);
+
+  // Slow clock
+  //pwm_set_clkdiv_int_frac(slice_num, 1, 0);
+  // RT-11 boot fails:
+  //pwm_set_wrap(slice_num, 19);
+  //pwm_set_chan_level(slice_num, channel, 10);
+  // RT-11 boot marginal
+  //pwm_set_wrap(slice_num, 20);
+  //pwm_set_chan_level(slice_num, channel, 10);
+  //pwm_set_wrap(slice_num, 21);
+  //pwm_set_chan_level(slice_num, channel, 11);
+  // RT-11 boot succeeds:
+  pwm_set_wrap(slice_num, 23);
+  pwm_set_chan_level(slice_num, channel, 12);
+  //pwm_set_wrap(slice_num, 25);
+  //pwm_set_chan_level(slice_num, channel, 13);
+  //pwm_set_wrap(slice_num, 27);
+  //pwm_set_chan_level(slice_num, channel, 14);
+  //pwm_set_wrap(slice_num, 29);
+  //pwm_set_chan_level(slice_num, channel, 15);
+  //pwm_set_clkdiv_int_frac(slice_num, 2, 0); // 3.75 
+  //pwm_set_clkdiv_int_frac(slice_num, 2, 128); // 750KHz
+  //pwm_set_clkdiv_int_frac(slice_num, 1, 128);
+  //pwm_set_clkdiv_int_frac(slice_num, 1, 64); // 1.5 MHz
+  //pwm_set_wrap(slice_num, 19);
+
+  // And enable it
+  pwm_set_enabled(slice_num, true);
+
+  // Init control signal reception
+
+  gpio_init(T11_BCLR_PIN);
+  gpio_set_dir(T11_BCLR_PIN, GPIO_IN);
+
+
+  gpio_init(T11_RAS_PIN);
+  gpio_init(T11_CAS_PIN);
+  gpio_init(T11_PI_PIN);
+  gpio_init(T11_SEL0_PIN);
+  gpio_init(T11_SEL1_PIN);
+  gpio_init(T11_RWHB_PIN);
+  gpio_init(T11_RWLB_PIN);
+
+  gpio_set_dir(T11_RAS_PIN, GPIO_IN);
+  gpio_set_dir(T11_CAS_PIN, GPIO_IN);
+  gpio_set_dir(T11_PI_PIN, GPIO_IN);
+  gpio_set_dir(T11_SEL0_PIN, GPIO_IN);
+  gpio_set_dir(T11_SEL1_PIN, GPIO_IN);
+  gpio_set_dir(T11_RWHB_PIN, GPIO_IN);
+  gpio_set_dir(T11_RWLB_PIN, GPIO_IN);
+
+
+  // Setup for halt interrupts
+  gpio_init(T11_HLT_PIN);
+  gpio_put(T11_HLT_PIN, 1);
+  gpio_set_dir(T11_HLT_PIN, GPIO_OUT);
+
+}
+
+volatile uint32_t *get_pio_sync_addr(PIO pio) {
+  if (pio == pio0) return &pio0->input_sync_bypass;
+  else if (pio == pio1) return &pio1->input_sync_bypass;
+  else if (pio == pio2) return &pio2->input_sync_bypass;
+
+  return 0;
+}
+
+
+// Shared PIO bus init
+uint32_t bus_program_init(uint bclr_pin, uint ras_pin, uint sel_1_pin,
+			  uint data_pin_base, uint irq_pin_base) {
+
+  // No need to set pin base - done by pio_claim...gpio_range() 
+  // Set GPIO pin base
+  //pio_set_gpio_base(pio, 16);
+
+  // Init data bus out GPIOs (T-11 clock is on data bus MSB + 1 pin)
+  // Remaining pins are input, so no need to initialize
+  for (int i = 0; i < 16; i++) {
+    pio_gpio_init(pio, data_pin_base + i);
+  }
+
+  // Init interrupt pins
+  for (int i = 0; i < 4; i++) {
+    pio_gpio_init(pio, irq_pin_base + i);
+  }
+
+  // Set data bus pins to input
+  pio_sm_set_consecutive_pindirs(pio, sm_bclr, data_pin_base, 16, false);
+
+  // Get BCLR config
+  pio_sm_config c = bus_bclr_program_get_default_config(offset_bclr);
+
+  // Set data bus pins base for output to T-11
+  sm_config_set_out_pins(&c, data_pin_base, 16);
+
+  // bclr + data bus + control
+  sm_config_set_in_pins(&c, bclr_pin);
+
+  // Set input FIFO shift right, auto push enabled, 32 bit threshold
+  sm_config_set_in_shift(&c, true, true, 32);
+
+  // Set BCLR pin as jump pin
+  sm_config_set_jmp_pin(&c, bclr_pin); 
+
+  // DEBUGGING BCLR - set pins
+  //sm_config_set_set_pins(&c, 16, 1);
+
+  // Use system clock as PIO clock
+  float div = 1.0f;
+  sm_config_set_clkdiv(&c, div);
+
+  uint32_t start_bclr = offset_bclr + bus_bclr_offset_start;
+  uint32_t results = pio_sm_init(pio, sm_bclr, start_bclr, &c);
+  if (results) printf("BCLR: failed to init\n");
+
+  // Get OP config
+  c = bus_op_program_get_default_config(offset_op);
+
+  // Set data bus pins base for output to T11
+  sm_config_set_out_pins(&c, data_pin_base, 16);
+
+  // Set input pins base to data pins
+  sm_config_set_in_pins(&c, data_pin_base);
+  sm_config_set_in_pin_count(&c, 25);
+
+  // Set input FIFO shift right, auto push enabled, 32 bit threshold
+  sm_config_set_in_shift(&c, true, true, 32);
+
+  // Set output FIFO shift right, auto pull enabled, 21 bit threshold
+  // Threshold set to bits used by PIO code so that we get next op queued up
+  sm_config_set_out_shift(&c, true, true, 21);
+
+  // Set sel<1> pin as jump pin so we can detect IACK cycles
+  sm_config_set_jmp_pin(&c, sel_1_pin); 
+
+  // Use system clock as PIO clock
+  div = 1.0f;
+  sm_config_set_clkdiv(&c, div);
+
+  uint32_t start_op = offset_op + bus_op_offset_start;
+  results = pio_sm_init(pio, sm_op, start_op, &c);
+  if (results) printf("OP: failed to init\n");
+
+  // Get IACK config
+  c = bus_iack_program_get_default_config(offset_iack);
+
+  // Set interrupt pins to output
+  pio_sm_set_consecutive_pindirs(pio, sm_iack, irq_pin_base, 4, true);
+
+  // Set input pins base to data pins
+  sm_config_set_in_pins(&c, data_pin_base);
+
+  // Set data bus pins base for output to T11
+  sm_config_set_out_pins(&c, data_pin_base, 8);
+
+  // Set output FIFO shift right, auto pull enabled, 32 bit threshold
+  sm_config_set_out_shift(&c, true, true, 32);
+
+  // Set T11 interrupt pins for use with set instruction
+  sm_config_set_set_pins(&c, irq_pin_base, 4);
+
+  // Set T11 interrupt pins for use with side set
+  sm_config_set_sideset_pins(&c, irq_pin_base);
+
+  // Set wrap target to re-use sm_bus rd_op code
+  uint32_t iack_wrap_target = offset_iack + bus_iack_wrap_target;
+  uint32_t iack_wrap = offset_op + bus_op_offset_iack_wrap;
+  sm_config_set_wrap(&c, iack_wrap_target, iack_wrap);
+
+  // Use system clock as PIO clock
+  div = 1.0f;
+  sm_config_set_clkdiv(&c, div);
+
+  uint32_t start_iack = offset_iack + bus_iack_offset_start;
+  results = pio_sm_init(pio, sm_iack, start_iack, &c);
+  if (results) printf("IACK: failed to init\n");
+
+  // Get IO config
+  c = bus_op_program_get_default_config(offset_op);
+
+  sm_config_set_in_pins(&c, data_pin_base);
+  sm_config_set_in_pin_count(&c, 25);
+
+  // Make 8 entry RX FIFO
+  sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+  // Set input FIFO shift right, auto push enabled, 32 bit threshold
+  sm_config_set_in_shift(&c, true, true, 32);
+
+  // Set wrap target to re-use sm_bus wait_pi code
+  uint32_t io_wrap_target = offset_op + bus_op_offset_bus_io_wrap_target;
+  uint32_t io_wrap = offset_op + bus_op_offset_bus_io_wrap;
+
+  //uint32_t io_wrap = offset_op + bus_op_offset_io_wrap;
+  //uint32_t io_wrap = offset_io + bus_io_offset_io_wrap;
+  //printf("computed wrap/wrap_target: %2d %2d\n", io_wrap, io_wrap_target);
+  sm_config_set_wrap(&c, io_wrap_target, io_wrap);
+
+  // Use system clock as PIO clock
+  div = 1.0f;
+  sm_config_set_clkdiv(&c, div);
+
+#ifdef SEPERATE_BUS_IO
+  uint32_t start_io = offset_io + bus_io_offset_start;
+#else
+  uint32_t start_io = offset_op + bus_op_offset_bus_io_start;
+#endif
+
+  results = pio_sm_init(pio, sm_io, start_io, &c);
+  if (results) printf("IO: failed to init\n");
+
+  // Turn off input synchronization, since we're running the bus from sys clk
+  //  hw_set_bits(get_pio_sync_addr(pio), 0xffff << data_pin_base);
+  hw_set_bits(get_pio_sync_addr(pio), -1);
+
+
+  // BCLR: Put emu_mem MSBs and T-11 mode register value into X register
+  uint32_t bclr_x = (uint32_t)emu_mem & 0xffff0000 | T11_MODE;
+  pio_sm_put_blocking(pio, sm_bclr, bclr_x);
+  pio_sm_exec(pio, sm_bclr, pio_encode_pull(false, true));
+  pio_sm_exec(pio, sm_bclr, pio_encode_out(pio_x, 32));
+
+  // OP: Put emu_mem MSBs into X register
+  uint32_t op_x = (uint32_t)emu_mem >> 16;
+
+  pio_sm_put_blocking(pio, sm_op, op_x);
+  pio_sm_exec(pio, sm_op, pio_encode_pull(false, true));
+  pio_sm_exec(pio, sm_op, pio_encode_out(pio_x, 32));
+
+  // IO: put 3 in Y reg to re-use wr_op in sm_op code
+  pio_sm_exec(pio, sm_io, pio_encode_set(pio_y, 3));
+
+  return 0;
+}
+
+void reset_dma(void) {
+  uint32_t mask = (1u << NUM_DMA_CHANNELS) - 1;
+
+  // Stop any DMAs in progress
+  dma_hw->abort = mask;
+    
+  // Wait until done
+  while (dma_hw->abort & mask) {
+    tight_loop_contents();
+  }
+
+}
+
+uint32_t *get_fifo_rx_addr(PIO pio, uint sm) {
+
+  if (pio == pio0) return (uint32_t *)&pio0->rxf[sm];
+  else if (pio == pio1) return (uint32_t *)&pio1->rxf[sm];
+  else if (pio == pio2) return (uint32_t *)&pio2->rxf[sm];
+
+  return 0;
+}
+
+uint32_t *get_fifo_tx_addr(PIO pio, uint sm) {
+
+  if (pio == pio0) return (uint32_t *)&pio0->txf[sm];
+  else if (pio == pio1) return (uint32_t *)&pio1->txf[sm];
+  else if (pio == pio2) return (uint32_t *)&pio2->txf[sm];
+
+  return 0;
+}
+
+
+// DMA command structures
+typedef struct dma_control_block {
+  uint32_t* read_addr;
+  uint32_t* write_addr;
+  uint32_t transfer_count;
+  uint32_t ctrl_trig;
+} dma_control_block_t;
+
+// DMA command block storage
+// bus_op * 256 bytes
+//#define BLK_MAX (4*256)/sizeof(dma_control_block_t)
+#define BLK_MAX (256*256)/sizeof(dma_control_block_t)
+dma_control_block_t dma_cmd_blk[BLK_MAX] __attribute__((aligned(BLK_MAX * 2)));
+
+// Index to blocks pointed to by bus_op
+// Index is: <12:08> - bus_op, <07:00> - zeros
+#define RD_BLK 0
+#define HB_BLK (1*256)/sizeof(dma_control_block_t)
+#define LB_BLK (2*256)/sizeof(dma_control_block_t)
+#define WR_BLK (3*256)/sizeof(dma_control_block_t)
+
+// Setup DMA command block addresses for each bus_op offset
+dma_control_block_t* rd_dma_blk_addr = &dma_cmd_blk[RD_BLK];
+dma_control_block_t* hb_dma_blk_addr = &dma_cmd_blk[HB_BLK];
+dma_control_block_t* lb_dma_blk_addr = &dma_cmd_blk[LB_BLK];
+dma_control_block_t* wr_dma_blk_addr = &dma_cmd_blk[WR_BLK];
+
+
+// DMA channels
+// Byte copy from RXFIFO to memory
+uint32_t bus_op_dma_chan;
+dma_channel_config bus_op_cfg;
+// Base address of DMA command blocks
+// Bits <15:08> will be written with bus_op via DMA
+volatile uint32_t bus_op_cmd  = (uint32_t)(&dma_cmd_blk[0]);
+
+// LW copy from bus_op_cmd to DMA fetch source address 
+uint32_t bus_op_cp_dma_chan;
+dma_channel_config bus_op_cp_cfg;
+// Fetch CMD block channel
+uint32_t cmd_fetch_dma_chan;
+dma_channel_config cmd_fetch_cfg;
+// Execute DMA command channel
+uint32_t cmd_exe_dma_chan;
+dma_channel_config cmd_exe_cfg;
+
+void blk_init(PIO pio, uint sm_o,
+	      uint32_t bus_op, uint32_t cmd_fetch, uint32_t cmd_exe) {
+
+  for (int i = 0; i < 256; i++) {
+    dma_cmd_blk[i].read_addr = (uint32_t *)i;
+    dma_cmd_blk[i].ctrl_trig = 0;
+  }
+
+  // Address transfer control block control word
+  // Fetch adress from sm_bus RXFIFO, write to data source/dest control blk
+  // Used by read, write byte, write word commands
+  dma_channel_config xfer_cfg = dma_channel_get_default_config(cmd_exe);
+  // Copy one LW from RXFIFO to destination
+  channel_config_set_read_increment(&xfer_cfg, false);
+  channel_config_set_write_increment(&xfer_cfg, false);
+
+  // Set DREQ to RXFIFO to wait for address
+  channel_config_set_dreq(&xfer_cfg, pio_get_dreq(pio, sm_o, false));
+
+  // Chain back to fetch DMA command block 
+  channel_config_set_chain_to(&xfer_cfg, cmd_fetch);
+  
+  uint32_t xfer_ctl = channel_config_get_ctrl_value(&xfer_cfg);
+
+  // Read memory control block control word
+  // Read from memory, write to TX FIFO
+  // Default is DREQ_FORCE - no pacing
+  dma_channel_config rd_cfg = dma_channel_get_default_config(cmd_exe);
+
+  // Copy one word from memory to destination
+  channel_config_set_read_increment(&rd_cfg, false);
+  //channel_config_set_write_increment(&rd_cfg, false);
+
+  // Set 16 bit transfer size
+  channel_config_set_transfer_data_size(&rd_cfg, DMA_SIZE_16);
+
+  // Chain back to bus_op to start the chain again
+  channel_config_set_chain_to(&rd_cfg, bus_op);
+
+  uint32_t rd_ctl = channel_config_get_ctrl_value(&rd_cfg);
+
+  // Write byte memory control block control word
+  dma_channel_config wb_cfg = dma_channel_get_default_config(cmd_exe);
+
+  // Copy one byte from memory to destination
+  channel_config_set_read_increment(&wb_cfg, false);
+  channel_config_set_write_increment(&wb_cfg, false);
+
+  // Set DREQ to RXFIFO to wait for write data
+  channel_config_set_dreq(&wb_cfg, pio_get_dreq(pio, sm_o, false));
+
+  // Set 8 bit transfer size
+  channel_config_set_transfer_data_size(&wb_cfg, DMA_SIZE_8);
+
+  // Chain back to bus_op to start the chain again
+  channel_config_set_chain_to(&wb_cfg, bus_op);
+
+  // Enable the channel
+  //channel_config_set_enable(&wb_cfg, true);
+
+  uint32_t wb_ctl = channel_config_get_ctrl_value(&wb_cfg);
+
+  // Write word memory control block control value
+  dma_channel_config wr_cfg = dma_channel_get_default_config(cmd_exe);
+
+  // Copy one word from memory to destination
+  channel_config_set_read_increment(&wr_cfg, false);
+  channel_config_set_write_increment(&wr_cfg, false);
+
+  // Set DREQ to RXFIFO to wait for write data from PIO
+  channel_config_set_dreq(&wr_cfg, pio_get_dreq(pio, sm_o, false));
+
+  // Set 16 bit transfer size
+  channel_config_set_transfer_data_size(&wr_cfg, DMA_SIZE_16);
+
+  // Chain back to bus_op to start the chain again
+  channel_config_set_chain_to(&wr_cfg, bus_op);
+  
+  uint32_t wr_ctl = channel_config_get_ctrl_value(&wr_cfg);
+
+  // Read command blocks:
+  // 1) Copy from RXFIFO to read command block, chain to cmd_cp channel
+  // 2) Copy read command block to execute channel, chain to bus_op channel
+ 
+ // Get fifo read port address
+  uint32_t* rxf_addr = get_fifo_rx_addr(pio, sm_o);
+  //printf("rxf fifo addr: %08x\n", (uint32_t) rxf_addr);
+  uint32_t* txf_addr = get_fifo_tx_addr(pio, sm_o);
+  //printf("txf fifo addr: %08x\n", (uint32_t) txf_addr);
+
+  dma_cmd_blk[RD_BLK].read_addr = rxf_addr;
+  dma_cmd_blk[RD_BLK].write_addr = (uint32_t *)&(dma_cmd_blk[RD_BLK+1].read_addr);
+  dma_cmd_blk[RD_BLK].transfer_count = 1;
+  dma_cmd_blk[RD_BLK].ctrl_trig = xfer_ctl;
+
+  dma_cmd_blk[RD_BLK+1].read_addr = 0; // Overwritten by above
+  dma_cmd_blk[RD_BLK+1].write_addr = txf_addr;
+  dma_cmd_blk[RD_BLK+1].transfer_count = 1;
+  dma_cmd_blk[RD_BLK+1].ctrl_trig = rd_ctl;
+  
+  // Write command blocks
+  // 1) Copy from RXFIFO to write command block, chain to cmd_cp channel
+  // 2) Copy write command block to execute channel, chain to bus_op channel
+  dma_cmd_blk[HB_BLK].read_addr = rxf_addr;
+  dma_cmd_blk[HB_BLK].write_addr = (uint32_t *)&(dma_cmd_blk[HB_BLK+1].write_addr);
+  dma_cmd_blk[HB_BLK].transfer_count = 1;
+  dma_cmd_blk[HB_BLK].ctrl_trig = xfer_ctl;
+
+  dma_cmd_blk[HB_BLK+1].read_addr = (void *)((uint32_t)rxf_addr + 1); // HB rd
+  dma_cmd_blk[HB_BLK+1].write_addr = 0; // Overwritten by above
+  dma_cmd_blk[HB_BLK+1].transfer_count = 1;
+  dma_cmd_blk[HB_BLK+1].ctrl_trig = wb_ctl;
+
+  dma_cmd_blk[LB_BLK].read_addr = rxf_addr;
+  dma_cmd_blk[LB_BLK].write_addr =  (uint32_t *)&(dma_cmd_blk[LB_BLK+1].write_addr);
+  dma_cmd_blk[LB_BLK].transfer_count = 1;
+  dma_cmd_blk[LB_BLK].ctrl_trig = xfer_ctl;
+
+  dma_cmd_blk[LB_BLK+1].read_addr = rxf_addr;
+  dma_cmd_blk[LB_BLK+1].write_addr = 0; // Overwritten by above
+  dma_cmd_blk[LB_BLK+1].transfer_count = 1;
+  dma_cmd_blk[LB_BLK+1].ctrl_trig = wb_ctl;
+
+  dma_cmd_blk[WR_BLK].read_addr = rxf_addr;
+  dma_cmd_blk[WR_BLK].write_addr =  (uint32_t *)&(dma_cmd_blk[WR_BLK+1].write_addr);
+  dma_cmd_blk[WR_BLK].transfer_count = 1;
+  dma_cmd_blk[WR_BLK].ctrl_trig = xfer_ctl;
+
+  dma_cmd_blk[WR_BLK+1].read_addr = rxf_addr;
+  dma_cmd_blk[WR_BLK+1].write_addr = 0; // Overwritten by above
+  dma_cmd_blk[WR_BLK+1].transfer_count = 1;
+  dma_cmd_blk[WR_BLK+1].ctrl_trig = wr_ctl;
+
+}
+
+
+void bus_op_dma_setup(PIO pio, uint sm_o) {
+
+  // In case we're still running
+  reset_dma();
+
+  // Setup bus op DMA channel, panic if none available
+  bus_op_dma_chan = dma_claim_unused_channel(true);
+  bus_op_cfg = dma_channel_get_default_config(bus_op_dma_chan);
+  // This channel starts the T11 read/write operation
+  channel_config_set_dreq(&bus_op_cfg, pio_get_dreq(pio, sm_o, false));
+
+  // Setup bus op copy DMA channel, panic if none available
+  bus_op_cp_dma_chan = dma_claim_unused_channel(true);
+  bus_op_cp_cfg = dma_channel_get_default_config(bus_op_cp_dma_chan);
+
+  // Setup command block fetch DMA channel, panic if none available
+  cmd_fetch_dma_chan = dma_claim_unused_channel(true);
+  cmd_fetch_cfg = dma_channel_get_default_config(cmd_fetch_dma_chan);
+
+  // Setup command execute DMA channel, panic if none available
+  cmd_exe_dma_chan = dma_claim_unused_channel(true);
+  cmd_exe_cfg = dma_channel_get_default_config(cmd_exe_dma_chan);
+
+  // Initialize DMA command blocks
+  blk_init(pio, sm_o, 
+	   bus_op_dma_chan, cmd_fetch_dma_chan, cmd_exe_dma_chan);
+
+  // Setup first part of DMA chain
+  // Read from bclr FIFO, write to scratch location
+  channel_config_set_read_increment(&bus_op_cfg, false);
+  channel_config_set_write_increment(&bus_op_cfg, false);
+
+  // Set 8 bit transfer size
+  channel_config_set_transfer_data_size(&bus_op_cfg, DMA_SIZE_8);
+
+  // Chain to copy op channel
+  channel_config_set_chain_to(&bus_op_cfg, bus_op_cp_dma_chan);
+
+  // Get fifo read port address
+  uint32_t* rx_fifo_addr = get_fifo_rx_addr(pio, sm_o);
+
+  // Make address of <15:08> portion of bus op command source
+  uint8_t* byte_to_wr = (uint8_t *)((uint32_t)&bus_op_cmd + 1);
+
+  // Write config and enable to start when RX_FIFO has data
+  dma_channel_configure(
+			bus_op_dma_chan,
+			&bus_op_cfg,
+			(void *)(byte_to_wr),    // Write addr
+			(void *)rx_fifo_addr,    // Read addr
+			1,                       // count
+			true                     // Wait for RX_DATA
+			);
+
+
+  // Configure bus op copy to command fetch channel operation
+  // Source address contained in bus_op_cmd
+  // Destination is source address of cmd fetch DMA channel
+
+  // Read from bus_op_cmd, write to command execute source addr channel
+  channel_config_set_read_increment(&bus_op_cp_cfg, false);
+  channel_config_set_write_increment(&bus_op_cp_cfg, false);
+
+  // Chain to fetch channel
+  channel_config_set_chain_to(&bus_op_cp_cfg, cmd_fetch_dma_chan);
+
+  // Get address of command fetch source address
+  volatile uint32_t* fetch_addr = &dma_hw->ch[cmd_fetch_dma_chan].read_addr;
+
+  // Write config
+  dma_channel_configure(
+			bus_op_cp_dma_chan,
+			&bus_op_cp_cfg,
+			(void *)(fetch_addr),          // Write addr
+			(void *)(&bus_op_cmd),         // Read addr
+			1,                             // count
+			false                          // wait for chain trig
+			);
+
+
+  // Configure command fetch operation
+  // Copy command block to command execution DMA channel
+
+  // Read from command block, write to DMA channel
+  channel_config_set_read_increment(&cmd_fetch_cfg, true);
+  channel_config_set_write_increment(&cmd_fetch_cfg, true);
+ 
+  // Make write address wrap after four longwords (size of DMA register block)
+  channel_config_set_ring(&cmd_fetch_cfg, true, 4);
+
+  // Get address of command execution source address
+  volatile uint32_t* exe_addr = &dma_hw->ch[cmd_exe_dma_chan].read_addr;
+
+  // Write config
+  dma_channel_configure(
+			cmd_fetch_dma_chan,
+			&cmd_fetch_cfg,
+			(void *)(exe_addr),            // Write addr
+			(void *)0,                     // Rd addr, set above
+			4,                             // count
+			false                          // Wait for chain
+			);
+
+
+}
+
+
+uint32_t rd_dma_chan;
+dma_channel_config rd_cfg;
+uint32_t *rd_fifo_addr;
+volatile uint32_t *rd_wr_addr;
+
+void test_dma_setup(PIO pio, uint sm) {
+  uint32_t rd_data_dma_chan;
+  dma_channel_config rd_data_cfg;
+
+  // In case we're still running
+  reset_dma();
+
+  // Setup read DMA channel, panic if none available
+  rd_dma_chan = dma_claim_unused_channel(true);
+  rd_cfg = dma_channel_get_default_config(rd_dma_chan);
+  channel_config_set_dreq(&rd_cfg, pio_get_dreq(pio, sm, false));
+
+  // Setup  data DMA channel, panic if none available
+  rd_data_dma_chan = dma_claim_unused_channel(true);
+  rd_data_cfg = dma_channel_get_default_config(rd_data_dma_chan);
+  channel_config_set_dreq(&rd_data_cfg, pio_get_dreq(pio, sm, true));
+
+
+  // Read from address FIFO, write to data DMA read address regi
+  channel_config_set_read_increment(&rd_cfg, false);
+  channel_config_set_write_increment(&rd_cfg, false);
+
+  // Set 16 bit transfer size
+  channel_config_set_transfer_data_size(&rd_cfg, DMA_SIZE_16);
+
+  // Get fifo read port address
+  rd_fifo_addr = get_fifo_rx_addr(pio, sm);
+
+  // Get data DMA read address register
+  rd_wr_addr = t11_rd_addr;
+
+  // Make endless
+  uint32_t endless = dma_encode_endless_transfer_count();
+
+  // Write config, don't start DMA
+  // Then we can just write src or dest, and trigger xfer via write to count
+  dma_channel_configure(
+			rd_dma_chan,
+			&rd_cfg,
+			(void *)rd_wr_addr,      // Write addr
+			(void *)rd_fifo_addr,    // Read addr
+			endless,  // count
+			false
+			);
+}
+
+
+// Allocate PIO and SMs for bus PIO programs
+void allocate_pio_resources(void) {
+
+  // Get base PIO and SM
+  bool s_status = pio_claim_free_sm_and_add_program_for_gpio_range 
+    (&bus_bclr_program, &pio, &sm_bclr, &offset_bclr, 18, 20, true);
+
+  if (!s_status) {
+    printf("BCLR: Failed pio/sm claim and/or program load\n");
+    while(1);
+  } else {
+    printf("BCLR: PIO: %d SM: %d\n", pio_get_index(pio), sm_bclr);
+    printf("GPIO_BASE for PIO %d: %d\n",
+	   pio_get_index(pio), pio_get_gpio_base(pio));
+  }
+	   
+  uint32_t pio_space_used = bus_bclr_program.length;
+
+  sm_op = pio_claim_unused_sm(pio, false);
+  if (sm_op < 0) {
+    printf("OP: Failed sm claim\n");
+    while(1);
+  } else {
+    printf("OP: SM: %d\n", sm_op);
+  }
+
+  offset_op = pio_add_program(pio, &bus_op_program);
+  if (offset_op < 0) printf("OP: failed to load PIO program\n");
+
+  pio_space_used += bus_op_program.length;
+
+  sm_iack = pio_claim_unused_sm(pio, false);
+  if (sm_iack < 0) {
+    printf("IACK: Failed sm claim\n");
+    while(1);
+  } else {
+    printf("IACK: SM: %d\n", sm_iack);
+  }
+
+  offset_iack = pio_add_program(pio, &bus_iack_program);
+  if (offset_iack < 0) printf("IACK: failed to load PIO program\n");
+
+  pio_space_used += bus_iack_program.length;
+
+  sm_io = pio_claim_unused_sm(pio, false);
+  if (sm_io < 0) {
+    printf("IO: Failed sm claim\n");
+    while(1);
+  } else {
+    printf("IO: SM: %d\n", sm_io);
+  }
+
+  printf("PIO program space total: %d\n", pio_space_used);
+  if (pio_space_used > 32) while(1);
+
+  // Start up PIO SMs
+  uint32_t i_status = bus_program_init(T11_BCLR_PIN, T11_RAS_PIN,
+				       T11_SEL1_PIN, 
+  				       T11_DAL0_PIN, T11_CP3_PIN);
+
+  if (i_status) printf("BUS: Failed init\n");
+  else printf("BUS: init successful\n");
+}
+
+// Free PIO resources
+void free_pio_resources(void) {
+
+  pio_sm_set_enabled(pio, sm_bclr, false);
+  pio_sm_unclaim(pio, sm_bclr);
+  pio_remove_program(pio, &bus_bclr_program, offset_bclr);
+
+  pio_sm_set_enabled(pio, sm_op, false);
+  pio_sm_unclaim(pio, sm_op);
+  pio_remove_program(pio, &bus_op_program, offset_op);
+
+  pio_sm_set_enabled(pio, sm_iack, false);
+  pio_sm_unclaim(pio, sm_iack);
+  pio_remove_program(pio, &bus_iack_program, offset_iack);
+
+  pio_sm_set_enabled(pio, sm_io, false);
+  pio_sm_unclaim(pio, sm_io);
+}
+
+ 
+// Turn on T-11 VCC, put mode bits on DAL bus during BCLR assertion
+
+void powerup(uint32_t verbosity) {
+
+  // If T-11 is on, turn off
+  gpio_set_dir(VCC_EN_PIN, GPIO_IN);
+  if (gpio_get(VCC_EN_PIN)) {
+    if (verbosity) printf("T-11 was powered on, turning off\n");
+    gpio_set_dir(VCC_EN_PIN, GPIO_OUT);
+    gpio_put(VCC_EN_PIN, 0);
+    sleep_ms(10);
+  }
+
+  if (verbosity) printf("Enabling T-11 power on pin %d\n", VCC_EN_PIN);
+  gpio_set_dir(VCC_EN_PIN, GPIO_OUT);
+  gpio_put(VCC_EN_PIN, 1);
+
+
+  // Wait for RAS to go high, signalling end of power up portion of reset
+  uint32_t ras_count = 0;
+  while(gpio_get(T11_RAS_PIN) == 0) {
+    sleep_us(1);
+    ras_count++;
+    if (ras_count > 1e6) {
+      printf("RAS failed to assert\n");
+      return;
+    }
+  }
+
+  // Wait a bit before starting SMs
+  if (verbosity) printf("RAS asserted for %d us\n", ras_count);
+  else sleep_us(100);
+
+  if (verbosity) printf("Enabling PIO state machines\n");
+
+  // Start SMs
+  pio_sm_set_enabled(pio, sm_bclr, true);
+  pio_sm_set_enabled(pio, sm_op, true);
+  pio_sm_set_enabled(pio, sm_iack, true);
+  pio_sm_set_enabled(pio, sm_io, true);
+
+  // Setup LA
+  la_program_init();
+
+  printf("LA PIO: %d SM: %d\n", pio_get_index(pio_la), sm_la);
+  printf("GPIO_BASE for PIO %d: %d\n",
+	   pio_get_index(pio_la), pio_get_gpio_base(pio_la));
+
+  // Wait for bclr reset to complete
+  uint32_t count = 0;
+  while(gpio_get(T11_BCLR_PIN) == 0) {
+    sleep_us(1);
+    count++;
+  }
+
+  if (verbosity) printf("BCLR asserted for %d us\n", count);
+}
+
+void powerdown(uint32_t verbosity) {
+
+  if (verbosity) printf("Disabling T-11 power on pin %d\n", VCC_EN_PIN);
+  gpio_put(VCC_EN_PIN, 0);
+  sleep_ms(1000);
+}
+
+
+uint32_t io_data;
+
+/*
+  Serial line emulation
+  Registers:
+  177560: (RCSR) - Control and status flags for incoming data
+  177562: (RBUF) - Receiver Buffer Register. Holds the received character
+  177564: (TCSR) - Control Transmitter Status Register 
+  177566: (TBUF) - Holds the character to be transmitted
+
+  Interrupt vectors:
+  RX 060 (octal)
+  TX 062 (octal)
+  priority: BR4
+
+  Register Bits
+  RCSR Bit 7: (Receiver Done - RDR DONE):
+  Set when an entire character is received and waiting in RBUF.
+  Cleared when RBUF is read.
+  RCSR Bit 6: (Receiver Interrupt Enable - RCVR INT ENB):
+  Set by software to enable interrupts when a character arrives.
+
+  XCSR Bit 7: (Transmitter Ready - XMIT RDY):
+  Set when the transmitter is ready to accept a new character in XBUF.
+  XCSR Bit 6: (Transmitter Interrupt Enable - XMIT INT ENB):
+  Set by software to enable interrupts when transmission completes.
+*/
+
+#define DL11_BASE 0177560
+#define RCSR_OFFSET 0
+#define RBUF_OFFSET 2
+#define TCSR_OFFSET 4
+#define TBUF_OFFSET 6
+#define TX_RDY  0x80
+#define TX_IE   0x40
+#define RX_RDY  0x80
+#define RX_IE   0x40
+#define DL11_RX_VEC 060
+#define DL11_TX_VEC 064
+
+#define DL11_TCSR (DL_BASE + TCSR_OFFSET)
+
+// Holds which hardware UART currently initialized by pico-sdk
+uart_inst_t *curr_uart;
+uart_hw_t *curr_uart_ptr;
+
+// Prefill the irq commands in dl11_emu_init() to save a little time
+uint32_t dl11_rx_irq_cmd = 0;
+uint32_t dl11_tx_irq_cmd = 0;
+
+volatile uint32_t dl11_tx_irq_prev = 0;
+
+// UART TX/RX interrupt handler
+// RX: Write received character to emulated DL11 rx buffer, and set ready flag
+// TX: set T11 interrupt (if enabled) when UART interrupt generated.
+void dl11_isr() {
+
+  // Handle RX interrupt if character present
+  if (uart_is_readable(curr_uart)) {
+    // Write character to simulated RX_BUF register
+    emu_mem[(DL11_BASE+RBUF_OFFSET)/2] = uart_getc(curr_uart);
+
+    // Set status flag
+    emu_mem[(DL11_BASE+RCSR_OFFSET)/2] |= RX_RDY;
+
+    // If RX interrupt enabled, send it to T11
+    if (emu_mem[(DL11_BASE+RCSR_OFFSET)/2] & RX_IE) {
+      // Send DL11 RX irq with priority 4 
+      pio_sm_put(pio, sm_iack, dl11_rx_irq_cmd);
+    }
+  }
+
+  // If TX interrupt enabled, send it to T11 if DL11 IE set
+  if (curr_uart_ptr->imsc & UART_UARTIMSC_TXIM_BITS) {
+
+    // Disable RP2350 UART TX irq (will be enabled when new T11 char sent)
+    uart_set_irq_enables(curr_uart, true, false);
+
+    // Set TX ready (note: also done in emulated RCSR read)
+    //emu_mem[(DL11_BASE+TCSR_OFFSET)/2] |= TX_RDY;
+
+    // Test if we're sending interrupts, send one to T11 if so
+    if (emu_mem[(DL11_BASE+TCSR_OFFSET)/2] & TX_IE) {
+      // Send DL11 TX irq with priority 4
+      pio_sm_put(pio, sm_iack, dl11_tx_irq_cmd);
+    }
+  }
+
+#if 0
+  // Check to make sure we've read character
+  if (emu_mem[(DL11_BASE+RCSR_OFFSET)/2] & RX_RDY) {
+    printf("!");
+    return;
+  }
+#endif
+
+}
+
+
+void dl11_emu_init(void) {
+
+  // Generate pointer to selected uart
+  curr_uart_ptr = PICO_DEFAULT_UART ? uart1_hw : uart0_hw;
+  curr_uart = (uart_inst_t *)curr_uart_ptr;
+
+  // Turn off FIFO's - we want to do this character by character
+  //uart_set_fifo_enabled(curr_uart, false);
+
+  // Get IRQ for UART RX/TX events
+  int dl11_irq = PICO_DEFAULT_UART ? UART1_IRQ : UART0_IRQ;
+
+  // And set up and enable the interrupt handler
+  irq_set_exclusive_handler(dl11_irq, dl11_isr);
+  irq_set_enabled(dl11_irq, true);
+
+  // Enable RX interrupts. TX is enabled when char written to tx buf.
+  uart_set_irq_enables(curr_uart, true, false);
+
+  // Reset DL11 registers
+  emu_mem[(DL11_BASE+RCSR_OFFSET)/2] = 0;
+  emu_mem[(DL11_BASE+TCSR_OFFSET)/2] = 0;
+
+  // Setup the IRQ SM FIFO commands
+  dl11_rx_irq_cmd = (DL11_RX_VEC << 16) | pio_encode_set(pio_pins, T11_CP_4);
+  dl11_tx_irq_cmd = (DL11_TX_VEC << 16) | pio_encode_set(pio_pins, T11_CP_4);
+
+  // And reset TX IRQ previous state
+  dl11_tx_irq_prev = 0; 
+
+}
+
+uint32_t dl11_emu(uint32_t addr, uint32_t wr_data) {
+
+  uint32_t wr = (~addr & T11_RD_MASK);
+
+  volatile uint16_t *emu_addr = &emu_mem[(addr & 0xffff)/2];
+
+  uint32_t reg_sel = addr & 0x7;
+
+
+  switch (reg_sel) {
+  case RCSR_OFFSET: // RX CSR
+    break;
+  case RBUF_OFFSET: // RX buf
+    // Clear ready flag when character read
+    if (!wr) {
+      emu_mem[(DL11_BASE+RCSR_OFFSET)/2] &= ~RX_RDY;
+    }
+    break;
+  case TCSR_OFFSET: // TX CSR
+    // Reflect current status of RP2350 TX buffer when reading CSR
+    if (!wr) {
+      if (uart_is_writable(curr_uart)) *emu_addr |= TX_RDY;
+      else *emu_addr = *emu_addr & ~TX_RDY;
+    } else {
+      // Enabling interrupts from previously disabled state, so send T11 IRQ
+      if ((dl11_tx_irq_prev == 0) && ((wr_data & TX_IE) == TX_IE)) {
+	pio_sm_put(pio, sm_iack, dl11_tx_irq_cmd);
+      }
+      // Update flag
+      dl11_tx_irq_prev = wr_data & TX_IE;
+    }
+    break;
+
+  case TBUF_OFFSET: // TX buf
+    if (wr) {
+      // Should always be ready (i.e. not blocking)
+      uart_putc_raw(curr_uart, wr_data);
+
+      // Clear ready flag when char written
+      emu_mem[(DL11_BASE+TCSR_OFFSET)/2] &= ~TX_RDY;
+
+      // Generate TX interrupt. Let ISR decide to send it to T11 (late binding)
+      uart_set_irq_enables(curr_uart, true, true);      
+
+    }
+    break;
+  }
+
+  // Claim this address
+  return 1;
+}
+
+/*
+  KW11 Line Time Clock emulation
+  The KW11-L provides periodic interrupts synchronized to the AC power
+  line frequency (50 Hz or 60 Hz). It maps to a single status
+  register.
+
+  Fixed Unibus Address: 177546 (also referred to as LKS or LCS)
+  Interrupt Vector: 100 (octal)
+  Interrupt Priority: BR6
+
+  Register definition:
+  LKS Bit 7 - Clock Monitor (Done Flag): Read/Write (Write 0 only).
+  This bit is set to 1 by the hardware at every line clock tick (every
+  16.67ms for 60Hz or 20ms for 50Hz). It must be cleared by software
+  inside the interrupt handler.
+  LKS Bit 06 - Interrupt Enable (IE): Read/Write. Setting this bit to 1
+  enables the hardware to request a CPU interrupt whenever the Clock Monitor
+  flag (Bit 7) becomes set.
+
+*/
+
+#define KW11_BASE 0177546
+#define KW11_CSR_OFFSET 0
+#define KW11_CSR (KW11_BASE + KW11_CSR_OFFSET)
+
+#define KW11_DONE  0x80
+#define KW11_IE    0x40
+
+#define KW11_VEC   0100
+
+repeating_timer_t kw11_timer;
+
+volatile uint32_t kw11_count = 0;
+volatile uint32_t kw11_trigger = 0;
+volatile uint32_t kw11_DMA_trigger = 60;
+
+// This callback executes inside the hardware timer interrupt context
+uint32_t kw11_irq_cmd; // Filled in by kw11_emu_init()
+bool kw11_timer_callback(__unused repeating_timer_t *t) {
+
+  kw11_count++;
+  if (kw11_count > 59) {
+    kw11_count = 0;
+    kw11_trigger = 1;
+    kw11_DMA_trigger--;
+  }
+
+#if 0
+  if (kw11_DMA_trigger == 0) {
+    kw11_DMA_trigger = -1;
+    // Re-trigger the LA DMA
+    dma_channel_set_trans_count(la_dma_chan, LA_BUF_SIZE, true);
+    printf("LA DMA capture\n");
+    dma_channel_wait_for_finish_blocking(la_dma_chan);
+    for (int i = 0; i < 80; i++) {
+      printf("%3d ", i);
+      print_bus(la_buf[i]);
+    }    
+
+    int32_t pc = 0;
+    for (int i = 0; i < LA_BUF_SIZE; i++) {
+      pc = an_bus(pc);
+      if (pc < 0) {
+	if (pc == -1) printf("End of capture buf\n");
+	if (pc == -2) printf("PI not found\n");
+	break;
+      }
+    }
+    // Disassemble
+    dis_buf();
+  }
+#endif
+
+  emu_mem[KW11_CSR/2] |= KW11_DONE;
+  if (emu_mem[KW11_CSR/2] & KW11_IE) {
+    pio_sm_put(pio, sm_iack, kw11_irq_cmd);
+  }
+
+  // Keep timer alive
+  return true; 
+}
+
+
+void kw11_emu_init(void) {
+
+  //#define KW11_FREQ_50
+#ifdef KW11_FREQ_50
+  // Set a periodic interrupt every 20ms
+  add_repeating_timer_ms(-20, kw11_timer_callback, NULL, &kw11_timer);
+  printf("50HZ LTC\n");
+#else
+  // Set a periodic interrupt every 16.667ms
+  add_repeating_timer_us(-16667, kw11_timer_callback, NULL, &kw11_timer);
+#endif
+
+  // Setup irq cmd here for the ISR to use later
+  kw11_irq_cmd = (KW11_VEC << 16) | pio_encode_set(pio_pins, T11_CP_6);
+
+  // Reset KW11 register
+  emu_mem[KW11_CSR/2] = 0;
+  
+}
+
+uint32_t kw11_emu(uint32_t addr, uint32_t data) {
+
+  // Read/writes are handled by the DMA subsystem
+
+#if 0
+  // Send IRQ if enabling and was previously disabled
+  if ((data & KW11_IE) && ~(emu_mem[KW11_CSR/2] & KW11_IE)) {
+    pio_sm_put(pio, sm_iack, kw11_irq_cmd);
+  }
+#endif
+
+  // Claim this address
+  return 1;
+}
+
+
+
+// RK11 emulation
+
+/* --- RK11 Base Register Addresses (Octal) --- */
+#define RK11_BASE       0177400
+#define RKDS_ADDR       0177400   /* Drive Status Register */
+#define RKER_ADDR       0177402   /* Error Register */
+#define RKCS_ADDR       0177404   /* Control Status Register */
+#define RKWC_ADDR       0177406   /* Word Count Register */
+#define RKBA_ADDR       0177410   /* Current Bus Address Register */
+#define RKDA_ADDR       0177412   /* Disk Address Register */
+#define RKDB_ADDR       0177414   /* Data Buffer Register */
+
+/* --- RKCS (Control Status) Bit Masks --- */
+#define RKCS_GO         0000001   /* Start operation */
+#define RKCS_M_FUNC     0000006   /* Function mask (Bits 1-3) */
+#define RKCS_MEX        0000060   /* Memory Extension (Bits 4-5) */
+#define RKCS_IDE        0000100   /* Interrupt Enable */
+#define RKCS_RDY        0000200   /* Control Ready */
+#define RKCS_SSE        0000400   /* Stop on Soft Error */
+#define RKCS_PGE        0002000   /* Programming Error */
+#define RKCS_NXR        0004000   /* Non-Existent Reference (Memory) */
+#define RKCS_ERR        0100000   /* Composite Error Flag */
+
+/* RKCS Function Codes (Shifted right by 1 for easy switch-case) */
+#define RKCS_F_RESET    0         /* Control Reset */
+#define RKCS_F_WRITE    1         /* Write Data */
+#define RKCS_F_READ     2         /* Read Data */
+#define RKCS_F_WCHK     3         /* Write Check */
+#define RKCS_F_SEEK     4         /* Seek */
+#define RKCS_F_RHDR     5         /* Read Header */
+#define RKCS_F_WLOCK    6         /* Write Lock */
+#define RKCS_F_DRESET   7         /* Drive Reset */
+
+/* --- RKDA (Disk Address) Bit Extractor Macros --- */
+#define RKDA_GET_SECTOR(rkda)   ((rkda) & 0000007)        // Bits 0-2 (0-11 dec)
+#define RKDA_GET_SURFACE(rkda)  (((rkda) >> 4) & 0000001) // Bit 4 (0-1)
+#define RKDA_GET_CYL(rkda)      (((rkda) >> 5) & 0000377) // Bits 5-12 (0-202)
+#define RKDA_GET_DRIVE(rkda)    (((rkda) >> 13) & 0000007) // Bits 13-15 (0-7)
+
+/* --- RKER (Error Register) Bit Masks --- */
+#define RKER_WCE        0000001   /* Write Check Error */
+#define RKER_TE         0000002   /* Timing Error */
+#define RKER_NXD        0000040   /* Non-Existent Drive */
+#define RKER_NXC        0000100   /* Non-Existent Cylinder */
+#define RKER_NXS        0000200   /* Non-Existent Sector */
+#define RKER_OVR        0004000   /* Data Overflow */
+#define RKER_DRE        0010000   /* Drive Error */
+
+/* --- RKDS (Drive Status) Standard Constants --- */
+#define RKDS_OK         0004700   // Standard "Drive Ready/On-Cylinder" response
+
+
+/* Helper to construct the full physical address from registers */
+uint32_t get_rk11_physical_address(uint16_t rkcs, uint16_t rkba) {
+    /* Extract Bits 4 and 5 from RKCS */
+    uint32_t mex = (rkcs & 0000060) >> 4; 
+    
+    /* Shift MEX up to bits 16 and 17, then blend with RKBA */
+    uint32_t physical_addr = (mex << 16) | rkba;
+    
+    return physical_addr;
+}
+
+// Do simulated DMA from disk buffer to T-11 memory
+void execute_rk11_dma_transfer(uint16_t *rkcs, uint16_t *rkba, int16_t *rkwc, uint8_t *pdp11_memory, uint16_t *disk_buffer) {
+  int buffer_index = 0;
+
+  /* Transfer continues until Word Count (RKWC) overflows to 0 */
+  while (*rkwc != 0) {
+    uint32_t phys_addr = get_rk11_physical_address(*rkcs, *rkba);
+
+    /* Safeguard: Ensure we don't accidentally write into the I/O Page 
+       (Upper 8KB of the 18-bit space: 0760000 - 0777777) unless intended */
+    if (phys_addr >= 0760000) {
+      *rkcs |= 0004000; /* Set NXR (Non-Existent Reference) error flag */
+      break;
+    }
+
+    /* Simulate the 16-bit Word Transfer (Read operation example) */
+    // Write lower byte
+    pdp11_memory[phys_addr]     = disk_buffer[buffer_index] & 0xFF;
+    // Write upper byte
+    pdp11_memory[phys_addr + 1] = (disk_buffer[buffer_index] >> 8) & 0xFF;
+
+    /* Hardware Side-Effect: Increment the 16-bit Bus Address by 2 (bytes) */
+    uint32_t old_rkba = *rkba;
+    *rkba = (*rkba + 2) & 0xFFFF;
+
+    /* Hardware Side-Effect: If RKBA overflows past 16 bits, 
+       the spillover automatically increments the MEX bits in RKCS */
+    if (*rkba < old_rkba) {
+      uint16_t mex = (*rkcs & 0000060) >> 4;
+      mex = (mex + 1) & 0x3; /* Keep within 2 bits */
+      *rkcs = (*rkcs & ~0000060) | (mex << 4);
+    }
+
+    /* Hardware Side-Effect: Increment Word Count toward 0 */
+    *rkwc = (*rkwc + 1) & 0xFFFF;
+    buffer_index++;
+  }
+}
+
+/* --- RK11 Base Register Addresses (Octal) --- */
+#define RK11_BASE       0177400
+#define RKDS_ADDR       0177400   /* Drive Status Register */
+#define RKER_ADDR       0177402   /* Error Register */
+#define RKCS_ADDR       0177404   /* Control Status Register */
+#define RKWC_ADDR       0177406   /* Word Count Register */
+#define RKBA_ADDR       0177410   /* Current Bus Address Register */
+#define RKDA_ADDR       0177412   /* Disk Address Register */
+#define RKDB_ADDR       0177414   /* Data Buffer Register */
+
+// Vector
+#define RK11_VEC 0220
+
+// RK11 UNIBUS Register State
+//uint16_t rkds = 0;
+uint16_t rker = 0;
+uint16_t rkcs = 0;
+int16_t  rkwc = 0; // Word count is handled as a signed/2's complement number
+uint16_t rkba = 0;
+uint16_t rkda = 0;
+
+//FILE* rk05_disk_img = nullptr;    // Handle to the actual file on host system
+//uint8_t* pdp11_memory = nullptr;  // Pointer to emulator's main memory array
+
+uint8_t* pdp11_memory = (uint8_t *)emu_mem;  // Pointer to emulator's main memory array
+
+uint32_t rk11_irq_cmd; // Filled in by rk11_emu_init()
+
+// Open rk05 emulated disk file
+FIL rk11_fil;
+FATFS fs;
+void rk11_emu_init(void) {
+
+  FRESULT fr = f_mount(&fs, "", 1);
+  if (FR_OK != fr) {
+    printf("f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
+  }
+
+  // Open the emulated RK05 disk file
+  const char* const filename = "rk0.dsk";
+  fr = f_open(&rk11_fil, filename, FA_READ | FA_WRITE);
+  if (FR_OK != fr && FR_EXIST != fr) {
+    printf("f_open(%s) error: %s (%d)\n", filename, FRESULT_str(fr), fr);
+  }
+  printf("f_open(%s) status: %s (%d)\n", filename, FRESULT_str(fr), fr);
+
+#if 0
+  // Close the file
+  fr = f_close(&rk_fil);
+  if (FR_OK != fr) {
+    printf("f_close error: %s (%d)\n", FRESULT_str(fr), fr);
+  }
+
+  // Unmount the SD card
+  f_unmount("");
+#endif
+  
+  // Setup irq cmd here for the ISR to use later
+  rk11_irq_cmd = (RK11_VEC << 16) | pio_encode_set(pio_pins, T11_CP_5);
+
+  // Init registers
+  emu_mem[RKDS_ADDR/2] = 0;
+  emu_mem[RKER_ADDR/2] = 0;
+  emu_mem[RKCS_ADDR/2] = RKCS_RDY; // We're ready!
+  emu_mem[RKWC_ADDR/2] = 0;
+  emu_mem[RKBA_ADDR/2] = 0;
+  emu_mem[RKDA_ADDR/2] = 0;
+  emu_mem[RKDB_ADDR/2] = 0;
+}
+
+// T11 memory checksum
+uint32_t cksum(uint8_t *buf, uint32_t len) {
+  uint32_t sum = 0;
+  for (int i = 0; i < len; i++) {
+    sum += buf[i];
+  }
+  return sum;
+}
+
+// Read block zero into emulated memory starting at location 0
+uint32_t rk11_load_0() {
+
+  FRESULT fr = f_read(&rk11_fil, (uint8_t *)&emu_mem[0], 512, NULL);
+  if (FR_OK != fr) {
+    printf("f_read(%s) error: %s (%d)\n", "rk0.dsk", FRESULT_str(fr), fr);
+    return 1;
+  }
+
+  printf("Boot block loaded: chksum: %ld\n",
+	 cksum((uint8_t *)(&emu_mem[0]), 512));
+
+  return 0;
+}
+
+
+
+// RKCS Function Codes (Bits 1-3)
+#define RKCS_RESET  0
+#define RKCS_WRITE  1
+#define RKCS_READ   2
+#define RKCS_WCHK   3
+#define RKCS_SEEK   4
+
+
+void execute_rk05_operation() {
+
+  // Decode RKDA (Disk Address Register)
+  // RKDA layout: Cylinder (Bits 5-12), Surface/Head (Bit 4), Sector (Bits 0-3)
+  uint16_t rkda     = emu_mem[RKDA_ADDR/2];
+  uint32_t sector   = rkda & 0x0F;
+  uint32_t surface  = (rkda >> 4) & 0x01;
+  uint32_t cylinder = (rkda >> 5) & 0xFF;
+  uint32_t drive    = (rkda >> 13) & 0x07; // RK11 supports up to 8 drives
+
+  // Validation
+  if (sector >= 12 || cylinder >= 203 || drive != 0) {
+    emu_mem[RKCS_ADDR/2] |= (1 << 15); // Set error bit in RKCS
+    emu_mem[RKER_ADDR/2] |= (1 << 6);  // NXF (Non-existent drive) or NXD (Non-existent disk)
+    printf("INVALID sec/cyl/dri\n");
+    return;
+  }
+
+  // Calculate Byte Offset on RK05 Media
+  // RK05 has 12 sectors per track, 2 tracks (surfaces) per cylinder, 256 words (512 bytes) per sector
+  const uint32_t BYTES_PER_SECTOR = 512;
+  uint32_t block_number = ((cylinder * 2 + surface) * 12) + sector;
+  uint32_t file_offset = block_number * BYTES_PER_SECTOR;
+
+  // Seek the host disk image file
+  f_lseek(&rk11_fil, file_offset);
+
+  // Determine Transfer Size
+  // RKWC contains the 2's complement of the number of words to transfer
+  uint16_t rkwc = emu_mem[RKWC_ADDR/2];
+  uint32_t words_to_transfer = (rkwc == 0) ? 65536 : (65536 - (uint16_t)rkwc);
+  uint32_t bytes_to_transfer = words_to_transfer * 2;
+
+  // Resolve memory destination (combining RKBA and extended memory bits from RKCS 4-5)
+  uint32_t pdp11_bus_address = emu_mem[RKBA_ADDR/2] |
+    (((emu_mem[RKCS_ADDR/2] >> 4) & 0x03) << 16);
+
+  // Buffer for transferring data
+  uint8_t io_buffer[512]; 
+
+  // Perform I/O Transfer Loop
+  // TBD: eliminate io_buffer
+  uint32_t bytes_done = 0;
+  uint32_t function_code = (emu_mem[RKCS_ADDR/2] >> 1) & 0x07;
+
+  //printf("before pdp11_bus_address: %08x\n", pdp11_bus_address);
+  //  printf("RKDA:\t%06o\n", emu_mem[RKDA_ADDR/2]);
+
+  //  printf("RKDA:\t%06o lba: %6d %08x\n", 
+  //	 emu_mem[RKDA_ADDR/2], block_number, block_number);
+  //  printf("RKCS:\t%06o\n", emu_mem[RKCS_ADDR/2]);
+  //printf("TXCSR: \t%06o\n", emu_mem[(DL11_BASE+TCSR_OFFSET)/2]);
+  //printf("RXCSR: \t%06o\n", emu_mem[(DL11_BASE+RCSR_OFFSET)/2]);
+
+
+#if 0
+  printf("Before cmd\n");
+  printf("RKCS:\t%06o\n", emu_mem[RKCS_ADDR/2]);
+  printf("RKDA:\t%06o\n", emu_mem[RKDA_ADDR/2]);
+  printf("RKBA:\t%06o\n", emu_mem[RKBA_ADDR/2]);
+  printf("RKWC:\t%06o\n", emu_mem[RKWC_ADDR/2]);
+  printf("\n");
+#endif
+  uint32_t blk_cnt = block_number;
+  uint32_t blk_sum = 0;
+  uint32_t blk_tot = 0;
+  uint32_t mem_sum = 0;
+  uint32_t mem_tot = 0;
+  while (bytes_done < bytes_to_transfer) {
+    uint32_t chunk = bytes_to_transfer - bytes_done;
+    if (chunk > BYTES_PER_SECTOR) chunk = BYTES_PER_SECTOR;
+
+    if (function_code == RKCS_READ) {
+      f_read(&rk11_fil, io_buffer, chunk, NULL);
+#if 0
+      blk_sum = cksum(io_buffer, chunk);
+      blk_tot += blk_sum;
+      printf("blk/cksum: %d %d\n", blk_cnt++, blk_sum);
+#endif
+      // Write directly into PDP-11 emulated RAM
+      for (uint32_t i = 0; i < chunk; i++) {
+	pdp11_memory[pdp11_bus_address + bytes_done + i] = io_buffer[i];
+	// Make sure we don't stomp on memory beyond 64k
+	if ((pdp11_bus_address + bytes_done + i) > 0xffff) {
+	  printf("disk read beyond memory\n");
+	  return;
+	}
+      }
+#if 0
+      mem_sum = cksum(&pdp11_memory[pdp11_bus_address + bytes_done], chunk);
+      if (mem_sum != blk_sum) {
+	printf("blk/mem mismatch: %d %d\n", blk_sum, mem_sum);
+      }
+#endif
+    } 
+    else if (function_code == RKCS_WRITE) {
+#if 0
+      printf("writes disabled\n");
+      uart_set_irq_enables(curr_uart, false, false);
+
+      while(1);
+#endif
+
+      // Read from PDP-11 emulated RAM
+      for (uint32_t i = 0; i < chunk; i++) {
+	io_buffer[i] = pdp11_memory[pdp11_bus_address + bytes_done + i];
+	// Make sure we don't stomp on memory beyond 64k
+	if ((pdp11_bus_address + bytes_done + i) > 0xffff) {
+	  printf("disk write beyond memory\n");
+	  return;
+	}
+      }
+      // Do the write
+      f_write(&rk11_fil, io_buffer, chunk, NULL);
+    }
+
+    bytes_done += chunk;
+    // Bump the Disk Address
+    sector++;
+    if (sector > 11) {
+      sector = 0;
+      surface++;
+      if (surface > 1) {
+	cylinder++;
+	if (cylinder > 202) {
+	  emu_mem[RKCS_ADDR/2] |= (1 << 15); // Set error bit in RKCS
+	  emu_mem[RKER_ADDR/2] |= (1 << 6);  // NXF or NXD 
+	}
+      }
+    }
+    // Update Disk Address register
+    emu_mem[RKDA_ADDR/2] = drive << 13 | cylinder << 5 | surface << 4 | sector;
+
+    // Update Bus Address register
+    emu_mem[RKBA_ADDR/2] += chunk;
+
+  }
+#if 0
+  mem_tot = cksum(&pdp11_memory[pdp11_bus_address], bytes_done);
+  printf("total blk/mem: %d %d\n", blk_tot, mem_tot);
+
+  if (mem_tot != blk_tot) {
+    printf("total blk/mem mismatch: %d %d\n", blk_tot, mem_tot);
+  }
+#endif
+
+#if 0
+  printf("final addr/len/chk: %08x %04d %08x\n", pdp11_bus_address, bytes_done/2,
+	 cksum(pdp11_bus_address, bytes_done/2));
+
+  printf("after pdp11_bus_address: %08x\n", pdp11_bus_address + bytes_done);
+  printf("rkwc: %04o %04o\n", emu_mem[RKWC_ADDR/2], (0xffff - emu_mem[RKWC_ADDR/2]) + 1);
+  printf("blocks: %d\n", ((0xffff - emu_mem[RKWC_ADDR/2]) + 1)/256);
+#endif
+
+  //  Update Registers after Transfer
+  emu_mem[RKWC_ADDR/2] = 0;                                       // Transfer finished, word count rolls over to 0
+
+#if 0
+  printf("After cmd\n");
+  printf("RKCS:\t%06o\n", emu_mem[RKCS_ADDR/2]);
+  printf("RKDA:\t%06o\n", emu_mem[RKDA_ADDR/2]);
+  printf("RKBA:\t%06o\n", emu_mem[RKBA_ADDR/2]);
+  printf("RKWC:\t%06o\n", emu_mem[RKWC_ADDR/2]);
+  printf("\n");
+#endif
+#if 0
+  emu_mem[RKBA_ADDR/2] = (pdp11_bus_address + bytes_done) & 0xFFFF; // Update bus address register
+  emu_mem[RKCS_ADDR/2] &= ~0x30;                                  // Clean up old memory extension bits
+  emu_mem[RKCS_ADDR/2] |= ((pdp11_bus_address + bytes_done) >> 16) & 0x03; 
+#endif
+
+  // Clear Ready/Done flag behavior logic
+  //  emu_mem[RKCS_ADDR/2] |= (1 << 7); // Set Ready Bit (Bit 7), notifying the OS execution is finished
+
+  // Set Ready Bit
+  emu_mem[RKCS_ADDR/2] |= RKCS_RDY;
+
+  // Check if interrupts are enabled (Bit 6)
+  if (emu_mem[RKCS_ADDR/2] & (1 << 6)) {
+    // Trigger UNIBUS interrupt vector 0220 here...
+    pio_sm_put(pio, sm_iack, rk11_irq_cmd);
+  }
+}
+
+// Flag for main loop to signal disk operation to be performed
+volatile uint32_t rk11_cs_hit = 0;
+volatile uint32_t rk11_cs_go = 0;
+
+// Runs at ISR level, so be quick!
+uint32_t rk11_emu(uint32_t addr, uint32_t wr_data) {
+  uint32_t csr;
+  uint32_t wr = (~addr & T11_RD_MASK);
+
+  // Only writes affect state
+  if (wr == 0) return 1;
+
+  volatile uint16_t *emu_addr = &emu_mem[(addr & 0xffff)/2];
+
+  uint32_t reg_sel = addr & 0xf;
+
+  //if (wr) printf("reg/dat: %02x %04x\n", reg_sel, wr_data & 0xffff);
+  //if (wr) printf("reg/dat: %02d %04x\n", reg_sel, wr_data & 0xffff);
+
+  switch (reg_sel) {
+  case 0: // RKDS_ADDR
+    // Read only - Managed by read/write process
+    break;
+  case 2: // RKER_ADDR
+    // Read only - set to zero for now (no errors)
+    break;
+  case 4: // RKCS_ADDR
+    // 07 - Ready
+    // 06 - IE
+    // 05:04 - addr<17:16>
+    // 03:01 - function
+    // 00 - GO: execute command in 03:01
+    // If GO bit is set by the processor, do:
+    // 1) clear go bit
+    // 2) clear ready bit
+    //    if (!wr) csr = emu_mem[RKCS_ADDR/2];
+
+    //    if (wr) {
+      rk11_cs_hit = 1;
+      // Only set if previous go bit was clear
+      //      if ((wr_data & RKCS_GO) && ((emu_mem[RKCS_ADDR/2] & RKCS_GO) == 0)) {
+      //      if (((emu_mem[RKCS_ADDR/2] & RKCS_GO) == 0) && (wr_data & RKCS_GO)) {
+      //      if (((emu_mem[RKCS_ADDR/2] & RKCS_GO) == 0)) {
+      if ((wr_data & RKCS_GO)) {
+      //if ((wr_data & RKCS_GO) && !(csr & RKCS_GO)) {
+	// Clear go and ready bits
+	emu_mem[RKCS_ADDR/2] = emu_mem[RKCS_ADDR/2] & ~(RKCS_GO | RKCS_RDY);
+	// And signal main that there's work to do
+	rk11_cs_go = 1;
+      }
+      //}
+    break;
+  case 6: // RKWC_ADDR
+    // Twos complement of word count
+    break;
+  case 8: // RKBA_ADDR
+    // Bus address of data to/from disk
+    break;
+
+  case 10: // RKDA_ADDR
+    break;
+
+  case 12: // RKMR_ADDR
+    break;
+  case 14: // RKDB_ADDR:
+    break;
+  }
+
+  //  if (wr && !((reg_sel == 012) || (reg_sel == 010) || (reg_sel == 06)))
+  //      printf("reg/dat: %02o %04x\n", reg_sel, wr_data & 0xffff);
+  //if (rk11_cs_hit) printf("h");
+
+}
+
+// M9312 emulation
+#define M9312_BASE 0165000
+#define M9312_ROM1 0173200
+#define M9312_ROM2 0173400
+
+// Copy header file contents into emulated memory
+// Note:
+//  ROM 0 is reserved for T-11 boot code
+//  ROM 1 is RK05 boot
+//  ROM 2 is DL02 boot
+void m9312_emu_init(void) {
+  // Console ROM
+  for (int i = 0; i < M9312_CONSOLE_MOD_LEN; i++) {
+    emu_mem[M9312_BASE/2 + i] = m9312_console_mod[i];
+  }
+  // Boot ROM
+  for (int i = 0; i < M9312_ROM1_LEN/2; i++) {
+    emu_mem[M9312_ROM1/2 + i] = m9312_rom1[i];
+    emu_mem[M9312_ROM2/2 + i] = m9312_rom2[i];
+  }
+}
+
+// Reads handled by DMA
+uint32_t M9312_emu(uint32_t addr, uint32_t wr_data) {
+  return 1;
+}
+
+// ISR variables
+// Need to get two entries before doing emulation
+uint32_t io_sm_have_addr = 0;
+uint32_t io_addr; 
+
+
+// IO Decodes generated by IO handler functions
+#define NXM_VALID  (1 << 0)
+#define KW11_VALID (1 << 1)
+#define DL11_VALID (1 << 2)
+#define RK11_VALID (1 << 3)
+#define RL11_VALID (1 << 4)
+#define ROM_VALID  (1 << 5)
+
+// Define IO handler function
+typedef void (*io_func_t)(void);
+
+// IO handler functions called by ISR
+bool wr_cmd;
+volatile uint32_t io_valid = 0;
+void kw11_hit(void) { io_valid = KW11_VALID; }
+void dl11_hit(void) { io_valid = DL11_VALID; }
+void rk11_hit(void) { io_valid = RK11_VALID; }
+void rl11_hit(void) { io_valid = RL11_VALID; }
+void rom_hit(void)  { io_valid = ROM_VALID; }
+// Generate a HALT request to signal Non eXstent Memory (NXM) 
+void nxm_hit(void) {
+  wr_cmd = (~io_addr & T11_RD_MASK);
+  gpio_put(T11_HLT_PIN, wr_cmd);  
+  io_valid = NXM_VALID;
+}
+
+// IO function table offsets
+// IO_SIZE_POW is defined in t11_bus.pio 
+// Table defines number of IO space word addresses, so IO_SIZE_POW - 1 
+#define TABLE_SIZE (1 << (IO_SIZE_POW - 1))
+#define TABLE_SIZE_MASK (TABLE_SIZE - 1)
+#define KW11_OFFSET ((KW11_BASE >> 1) & TABLE_SIZE_MASK)
+#define DL11_OFFSET ((DL11_BASE >> 1) & TABLE_SIZE_MASK)
+#define RK11_OFFSET ((RK11_BASE >> 1) & TABLE_SIZE_MASK)
+#define RL11_OFFSET ((RL11_BASE >> 1) & TABLE_SIZE_MASK)
+#define ROM_OFFSET  ((T11_ROM_BASE >> 1) & TABLE_SIZE_MASK)
+#define M9312_OFFSET  ((M9312_BASE >> 1) & TABLE_SIZE_MASK)
+
+static const io_func_t io_table[] __attribute__((aligned(sizeof(io_func_t)))) __not_in_flash("fast_io_table") = {
+    [0 ... TABLE_SIZE - 1] = nxm_hit,
+
+    [KW11_OFFSET]                      = kw11_hit,
+    [DL11_OFFSET ... DL11_OFFSET +  3] = dl11_hit,
+    [RK11_OFFSET ... RK11_OFFSET +  7] = rk11_hit,
+    [RL11_OFFSET ... RL11_OFFSET +  3] = rl11_hit,
+
+    // T-11 (ROM 0) and M9212 boot (ROM 1, 2, 3) space
+    // ROM is 512 bytes so 256 words
+    [ROM_OFFSET  ... ROM_OFFSET + 255] = rom_hit,
+
+    // M9312 console ROM is 512B, so 256W
+    [M9312_OFFSET ... M9312_OFFSET + 255] = rom_hit
+
+};
+
+typedef struct reg_acc {
+  uint32_t addr;
+  uint32_t data;
+} reg_acc_t;
+
+#define REG_CAP_POW 9
+#define REG_CAP_SIZE (1 << REG_CAP_POW)
+#define REG_CAP_MASK (REG_CAP_SIZE - 1)
+
+reg_acc_t reg_cap[REG_CAP_SIZE];
+volatile uint32_t reg_cap_wr_count = 0;
+volatile uint32_t reg_cap_rd_count = 0;
+volatile uint32_t reg_count_en = 1;
+volatile uint32_t reg_dump_trigger = 0;
+
+
+volatile bool nxm = false;
+uint32_t nxm_cmp_val;
+bool hit;
+
+volatile bool io_rd = false;
+
+void io_sm_isr() {
+  
+  // Get IO address, test for validity, then wait for IO data
+  if (io_sm_have_addr == 0) {
+    io_addr = pio_sm_get_blocking(pio, sm_io);
+
+    // Get valid decodes, assert BOOT pin if NXM
+    io_table[(io_addr >> 1) & TABLE_SIZE_MASK]();
+
+    // Handle data next time through
+    io_sm_have_addr = 1;
+
+    // Set read/write flag
+    io_rd = (io_addr & T11_RD_MASK) == T11_RD_MASK;
+
+    // Wait for data
+    return;
+  }
+
+  // Handle HALT deassertion as fast as possible
+  if (io_valid & NXM_VALID) {
+    // RAS currently asserted
+    while (gpio_get(T11_RAS_PIN) == 0);
+
+    // Now we're at RAS rising edge
+    gpio_put(T11_HLT_PIN, 1);
+
+    // Dump data
+    pio_sm_get_blocking(pio, sm_io);
+    
+    // Reset state
+    io_sm_have_addr = 0;
+
+    return;
+  }
+
+  // Here when IO data received
+  uint32_t io_data = pio_sm_get_blocking(pio, sm_io);
+  
+  // Reset wait state to look for addresses next
+  io_sm_have_addr = 0;
+
+  // Save register operations for given device
+  if (io_valid & RL11_VALID) { 
+  //if (io_valid & RK11_VALID) { 
+    // Save address
+    reg_cap[reg_cap_wr_count].addr = io_addr;
+
+    // Save data from memory if read
+    if (io_rd) {
+      reg_cap[reg_cap_wr_count].data = emu_mem[(io_addr & 0xffff)/2];
+    } else {
+      reg_cap[reg_cap_wr_count].data = io_data;
+    }
+
+    reg_cap_wr_count = (reg_cap_wr_count + 1) & REG_CAP_MASK;
+  }
+
+  // Fast exit for ROM
+  if (io_valid & ROM_VALID) return;
+
+  if (io_valid & RK11_VALID) { rk11_emu(io_addr, io_data); return; }
+  if (io_valid & RL11_VALID) { rl11_emu(io_addr, io_data); return; }
+  if (io_valid & DL11_VALID) { dl11_emu(io_addr, io_data); return; }
+  if (io_valid & KW11_VALID) { kw11_emu(io_addr, io_data); return; }
+
+}
+
+#if 0
+void old_io_sm_isr() {
+  
+  // Get IO address, test for validity, then wait for IO data
+  if (io_sm_have_addr == 0) {
+    io_addr = pio_sm_get_blocking(pio, sm_io);
+
+    io_table[(io_addr >> 1) & 0x0FFF]();
+
+    io_sm_have_addr = 1;
+
+
+    // Get address 
+    nxm_cmp_val = io_addr & 0xffff;
+
+    // Do NXM interrupt generation (via HALT pin)
+    // Test for a hit in one of the address ranges or write
+    // A write is always a hit, since every write is preceeded by a read
+    // and we don't want to assert halt twice for one operation
+    // Compare with single word address space first 
+    hit = (nxm_cmp_val == KW11_BASE);
+
+    // Do successively larger address spaces
+
+    nxm_cmp_val = nxm_cmp_val >> DL11_ADDR_SHIFT;
+    hit = hit || (nxm_cmp_val == (DL11_BASE >> DL11_ADDR_SHIFT));
+
+    nxm_cmp_val = nxm_cmp_val >> RK11_CMP_SHIFT;
+    hit = hit || (nxm_cmp_val == (RK11_BASE >> RK11_ADDR_SHIFT));
+    
+    nxm_cmp_val = nxm_cmp_val >> ROM_CMP_SHIFT;
+    hit = hit || (nxm_cmp_val == (T11_ROM_BASE >> ROM_ADDR_SHIFT));
+
+    // Test for write
+    hit = hit || ((io_addr & T11_RD_MASK) != T11_RD_MASK);
+
+    // Assert HALT pin if we didn't get a hit
+    //gpio_put(T11_HLT_PIN, hit);
+
+    //nxm = !hit;
+
+    //if (nxm) gpio_put(T11_HLT_PIN, 0);
+
+    nxm = io_valid & NXM_VALID;
+
+    io_addr_valid = 0;
+    io_dl11_valid = 0;
+    io_rk11_valid = 0;
+    io_kw11_valid = 0;
+    io_rom_valid = 0;
+
+    // Test for valid
+    if ((io_addr & DL11_ADDR_MASK) == DL11_BASE) {
+      io_addr_valid = 1;
+      io_dl11_valid = 1;
+      //return;
+    }
+
+    if ((io_addr & RK11_ADDR_MASK) == RK11_BASE) {
+      io_addr_valid = 1;
+      io_rk11_valid = 1;
+      //return;
+    }
+
+    if ((io_addr & KW11_ADDR_MASK) == KW11_BASE) {
+      io_addr_valid = 1;
+      io_kw11_valid = 1;
+      //return;
+    }
+
+    // Mark ROM addresses as valid
+#if (T11_START == 7)
+    // ROM starts at 0172000, so overlaps with KW11-P
+    if (((io_addr & ROM_ADDR_MASK) == T11_ROM_BASE) &&
+	~((io_addr & 0xffff) == 0172540)) {
+      io_addr_valid = 1;
+      io_rom_valid = 1;
+      //return;
+    }
+#else
+    if ((io_addr & ROM_ADDR_MASK) == T11_ROM_BASE) {
+      io_addr_valid = 1;
+      io_rom_valid = 1;
+      //return;
+    }
+#endif
+
+    //if ((io_addr & 0xffff) == 0177776) printf("****PSW");
+    //    if ((io_addr & 0xffff) == 0172540) printf("P");
+    //    if ((io_addr & 0xffff) == 0172540) printf("P");
+
+    // Assert HALT for reads that miss 
+    // (Writes always have a read prior to the write)
+    //nxm = (io_addr_valid == 0) && ((~io_addr & T11_RD_MASK) == 0);
+    //nxm = (io_addr_valid == 0);
+    //if (nxm) gpio_put(T11_HLT_PIN, 0);
+
+    //    hit = (io_addr_valid) || ((~io_addr & T11_RD_MASK) != 0);
+    //if (!hit) gpio_put(T11_HLT_PIN, 0);
+    //hit = (io_addr_valid) || ((io_addr & T11_RD_MASK) != T11_RD_MASK);
+    //gpio_put(T11_HLT_PIN, hit);
+
+    // Wait for IO data next
+
+    return;
+  }
+
+  // Here when IO data received
+  uint32_t io_data = pio_sm_get_blocking(pio, sm_io);
+  
+  // Reset wait state to look for addresses next
+  io_sm_have_addr = 0;
+
+  // Fast exit for ROM
+  if (io_rom_valid) return;
+
+  //  printf("a/d: %06o %06o\n", io_addr & 0xffff, io_data & 0xffff);
+  //printf("%d %d\n", reg_cap_count, reg_dump_trigger/*count_en*/);
+#if 0
+  if (io_addr_valid == 0) {
+    reg_cap[reg_cap_count].addr = io_addr;
+    reg_cap[reg_cap_count].data = io_data;
+    reg_cap_count = reg_cap_count + reg_count_en;
+    reg_dump_trigger = 1;  
+    if (reg_cap_count > 100) reg_cap_count = 0;
+  }
+#endif
+
+#if 0
+  // Make sure we've serviced all FIFO entries
+  while (!pio_sm_is_rx_fifo_empty(pio, sm_io)) {
+    pio_sm_get(pio, sm_io);
+    printf("F");
+  }
+  //#else
+  if (!pio_sm_is_rx_fifo_empty(pio, sm_io)) {
+    printf("IO FIFO FULL, failure\n");
+    while(1);
+  }
+#endif
+
+  //  uint32_t rx_level = pio_sm_get_rx_fifo_level(pio, sm_io);
+  //if (rx_level > 0) printf("%d", rx_level);
+    
+
+  // Only do emulation for known addresses  
+  if (io_addr_valid == 1) {
+    if (io_rk11_valid) { rk11_emu(io_addr, io_data); return; }
+    if (io_dl11_valid) { dl11_emu(io_addr, io_data); return; }
+    if (io_kw11_valid) { kw11_emu(io_addr, io_data); return; }
+  }
+
+  // Deassert NXM HALT request at RAS rising edge
+  if (nxm) {
+    // RAS currently asserted
+    while (gpio_get(T11_RAS_PIN) == 0);
+
+    // Now we're at RAS rising edge
+    gpio_put(T11_HLT_PIN, 1);
+    nxm = 0;
+  }
+
+}
+#endif
+
+// Enable IO PIO SM interrupt
+// Choose which PIO irq to use for RX not empty
+#define IO_SM_IRQ 1
+void enable_bus_io_irq(PIO ena_pio, uint32_t ena_sm) {
+  enum pio_interrupt_source rx_irq;
+  
+  // Get NVIC IRQ for PIO instance
+  uint32_t pio_irq = pio_get_irq_num(ena_pio, IO_SM_IRQ);
+
+  // Point to IO SM ISR
+  irq_set_exclusive_handler(pio_irq, io_sm_isr);
+
+  // Enable NVIC 
+  irq_set_enabled(pio_irq, true);
+
+  // Now enable the SM interrupt
+  // Get RX FIFO threshold interrupt
+  rx_irq = (enum pio_interrupt_source)(pis_sm0_rx_fifo_not_empty + ena_sm);
+
+  // Enable it
+  if (IO_SM_IRQ == 0) {
+    pio_set_irq0_source_enabled(ena_pio, rx_irq, true);
+  } else {
+    pio_set_irq1_source_enabled(ena_pio, rx_irq, true);
+  }
+}
+
+
+// Should be run on second core
+volatile uint32_t old_reg_cap_wr_count = 0;
+volatile int32_t cap_delta;
+volatile uint32_t cap_tmp;
+volatile uint32_t cap_addr;
+volatile uint32_t old_addr = 0;
+volatile uint32_t old_data = 0;
+volatile uint32_t old_count = 0;
+volatile bool old_rd = 0;
+volatile bool rd = 0;
+
+void dump_cap_buf() {
+
+  while(1) {
+    cap_tmp = reg_cap_wr_count;
+    if (old_reg_cap_wr_count != cap_tmp) {
+      cap_delta = cap_tmp - old_reg_cap_wr_count;
+      if (cap_delta < 0) cap_delta += REG_CAP_SIZE;
+      cap_addr = old_reg_cap_wr_count;
+      for (int i = 0; i < cap_delta; i++) {
+	rd = (reg_cap[cap_addr].addr & T11_RD_MASK) == T11_RD_MASK;
+	if ((old_data == reg_cap[cap_addr].data) &&
+	    (old_addr == reg_cap[cap_addr].addr) &&
+	    (old_rd == rd)) {
+	  old_count++;
+	} else {
+	  if (old_count > 1) {
+	    if (old_rd) {
+	      printf("R %06o %06o\n",
+		     old_addr & 0xffff,
+		     old_data & 0xffff);
+	    } else {
+	      printf("W %06o %06o\n",
+		     old_addr & 0xffff,
+		     old_data & 0xffff);
+	    }
+	    printf("count: %d\n", old_count + 1);
+	  }
+	  if (rd) {
+	    printf("R %06o %06o\n",
+		   reg_cap[cap_addr].addr & 0xffff,
+		   reg_cap[cap_addr].data & 0xffff);
+	  } else {
+	    printf("W %06o %06o\n",
+		   reg_cap[cap_addr].addr & 0xffff,
+		   reg_cap[cap_addr].data & 0xffff);
+	  }
+	  old_count = 0;
+	  old_addr = reg_cap[cap_addr].addr;
+	  old_data = reg_cap[cap_addr].data;
+	  old_rd = rd;
+	}
+	cap_addr = (cap_addr + 1) & REG_CAP_MASK;
+	old_reg_cap_wr_count = cap_tmp;
+      }
+    }
+  }
+}
+
+int main() {
+
+
+  stdio_init_all();
+
+
+  // Init device emulators
+  kw11_emu_init();
+  dl11_emu_init();
+  rk11_emu_init();
+  rl11_emu_init();
+  m9312_emu_init();
+
+  // Init emulation memory (but not IO space)
+  for (int i = 0; i < (MEM_MAX - 4096); i++) {
+    emu_mem[i] = 0;
+  }
+
+  sleep_ms(100);
+
+  printf("T11 initial test\n");
+  powerdown(0);
+
+  int32_t ld_pc = 0;
+
+  //#define BOOT_RK
+  //#define BOOT_RL
+  //#define BOOT_RL_SIMH
+  #define BOOT_M9312
+
+#ifdef BOOT_RK
+  // Read in boot block
+  if (rk11_load_0()) printf("Blk 0 load failure\n");
+
+#elif defined BOOT_RL
+  // Read in boot block
+  if (rl11_load_0(0)) printf("Blk 0 load failure\n");
+  for (int i = 0; i < 16; i++) {
+    printf("addr/data: %d %06o %04x\n", i * 2, emu_mem[i], emu_mem[i]);
+  }
+
+#elif defined BOOT_RL_SIMH
+  // Use the simh RL02 boot loader
+  for (int i = 0; i < SIMH_RL_BOOT_LEN; i++) {
+    emu_mem[SIMH_RL_BOOT_START/2 + i] = simh_rl02_boot_rom[i];
+  }
+  // Jump to start of boot loader
+  emu_mem[0] = 0137;
+  emu_mem[1] = SIMH_RL_BOOT_ENTRY;
+
+#elif defined BOOT_M9312
+  // Jump to 0165144 
+  emu_mem[0] = 0137;
+  emu_mem[1] = 0165144;
+
+#else
+  // Load emulation memory with test code
+  printf("Loading default data array from lda_file.h\n");
+  ld_pc = load_lda((uint8_t *)&emu_mem[0], data);
+  if (ld_pc >= 0) printf("Loaded program start: %04x\n", ld_pc);
+  else {
+    printf("load error: %d\n", ld_pc);
+    printf("****STOPPING\n");
+    while(1);
+  }
+#endif
+  
+  // Load T11 ROM
+  ld_pc = load_lda((uint8_t *)&emu_mem[0], boot_rom);
+  if (ld_pc >= 0) {
+    printf("Boot ROM start: %06o\n", ld_pc);
+    if ((ld_pc != T11_ROM_BASE)) {
+      printf("WARNING: T11 start PC and boot ROM mismatch: %06o %06o\n",
+	    T11_ROM_BASE, ld_pc);
+    }
+    if ((ld_pc + boot_rom_size) > M9312_ROM1) {
+      printf("WARNING: T11 boot overwrites M9312_ROM1: %06o %06o\n",
+	     M9312_ROM1, ld_pc + boot_rom_size);
+      while(1);
+    }
+  } else {
+    printf("T11 ROM load error: %d\n", ld_pc);
+    printf("retry...");
+    ld_pc = load_lda((uint8_t *)&emu_mem[0], boot_rom);
+    if (ld_pc >= 0) {
+      printf("succeeded\n");
+    } else {
+      printf("failed\n****STOPPING\n");
+      while(1);
+    }
+  }
+
+  // Setup T-11 clock and RP2350 GPIOs
+  setup();
+
+  // Setup PIO machines
+  allocate_pio_resources();
+
+  // Setup DMA
+  bus_op_dma_setup(pio, sm_op);
+
+  // Turn on T-11
+  powerup(0);
+
+  // Wait for first instruction fetch (sel<0> == 1)
+  uint32_t inst_count = 0;
+  uint32_t dly_ras = 1;
+  uint32_t next_ras;
+
+  while(inst_count < 3) {
+    // Wait for RAS falling edge
+    next_ras = gpio_get(T11_RAS_PIN);
+    if ((next_ras == 0) & (dly_ras == 1)) {
+      inst_count = inst_count + (gpio_get(T11_SEL0_PIN) ? 1 : 0);
+      //      printf("ic: %d\n", inst_count);
+    }
+    dly_ras = next_ras;
+  }
+
+  // Start core 2 for debugging 
+#if 0
+  multicore_reset_core1();
+  multicore_fifo_drain();
+  multicore_launch_core1(dump_cap_buf);  
+#endif
+
+  // Enable emulation
+  enable_bus_io_irq(pio, sm_io);
+
+  while (1) {
+    // RL11 disk operations
+    if (rl11_cs_hit) {
+      rl11_cs_hit = 0;
+      if (rl11_cs_go) {
+	rl11_cs_go = 0;
+	rl11_execute_operation();
+	// Wait a bit
+	if (rl11_cs_hit) sleep_us(100);
+      }
+    }
+
+    // RK11 disk operations
+    if (rk11_cs_hit) {
+      rk11_cs_hit = 0;
+      uint32_t da_save = 0; //emu_mem[RKDA_ADDR/2];
+      //      if (emu_mem[RKCS_ADDR/2] & RKCS_GO) {
+      if (rk11_cs_go) {
+	// Clear go/ready bits again, to resolve race between DMA and ISR
+	emu_mem[RKCS_ADDR/2] = emu_mem[RKCS_ADDR/2] & ~(RKCS_GO | RKCS_RDY);
+	rk11_cs_go = 0;
+	execute_rk05_operation();
+      }
+    }
+  }
+
+  return 0;
+}

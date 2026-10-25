@@ -1,0 +1,51 @@
+	.title	M9312 'DL' BOOT from simh
+
+	bootstart =2000               ; start
+	bootentry =bootstart + 002    ; entry
+	unit       =0                 ; unit number
+	RLCS       =174400            ; CSR
+
+	.asect
+	. = 02000
+
+start: .ascii "LD"
+entry: MOV #bootstart, SP
+       MOV #unit, R0
+       MOV R0, R3
+       SWAB R3
+       MOV #RLCS, R1        ; csr
+       MOV #13, 4(R1)       ; clr err
+       BIS #4, R3           ; unit+gstat
+       MOV R3, (R1)         ; issue cmd
+       TSTB (R1)            ; wait
+       BPL .-2
+       CLRB R3
+       BIS #10, R3          ; unit+rdhdr
+       MOV R3, (R1)         ; issue cmd
+       TSTB (R1)            ; wait
+       BPL .-2
+       MOV 6(R1), R2        ; get hdr
+       BIC #77, R2          ; clr sector
+       INC R2               ; magic bit
+       MOV R2, 4(R1)        ; seek to 0
+       CLRB R3
+       BIS #6, R3           ; unit+seek
+       MOV R3, (R1)         ; issue cmd
+       TSTB (R1)            ; wait
+       BPL .-2
+       CLR 2(R1)            ; clr ba
+       CLR 4(R1)            ; clr da
+       MOV #-512., 6(R1)    ; set wc
+       CLRB R3
+       BIS #14, R3          ; unit+read
+       MOV R3, (R1)         ; issue cmd
+       TSTB (R1)            ; wait
+       BPL .-2
+       BIC #377, (R1)
+       CLR R2
+       CLR R3
+       MOV #START+20, R4
+       CLR R5
+       CLR PC
+
+       .end entry

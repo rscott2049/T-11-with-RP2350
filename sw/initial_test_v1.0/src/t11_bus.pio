@@ -1,0 +1,113 @@
+// Global define shared between PIO and C code
+.define public IO_SIZE_POW 13  // Select 12 for 4k or 13 for 8KB IO space
+
+
+// Do T11 read/write operations
+// Register X preloaded with emulated RAM address bits <31:16>
+// JMP pin instruction mapped to sel<1> for IACK cycle detection
+.program bus_op
+.define T11_DAL0_PIN 19
+.define T11_PI_PIN  (42 - T11_DAL0_PIN)
+.define T11_RAS_PIN (40 - T11_DAL0_PIN)
+
+// Must define code to start at 0 to enable PC wrap jump at end of code space
+  .origin 0
+
+// Start of shared code with bus_iack
+public rd_op:
+  out pins, 16                ; Put on DALs
+public iack_wrap:
+  mov pindirs, ~NULL          ; Make pins output with valid data (avoid glitch)
+// End of shared code with bus_iack
+
+public start:
+.wrap_target
+  wait 1 pin T11_RAS_PIN      ; Wait for RAS high
+  mov pindirs, NULL           ; Make DALs input
+  wait 0 pin T11_RAS_PIN      ; Wait for RAS low -> falling edge of assertion
+  jmp pin, iack_op            ; Service IACK cycles
+  mov OSR, ~pins              ; Get bus, inverted
+// I/O space decode
+  out NULL, IO_SIZE_POW       ; Skip over addr<1:0>
+  out y, (16 - IO_SIZE_POW)   ; Get inverted addr<15:13>
+  jmp y--, not_io             ; Not zero, so not an I/O space access
+  irq nowait 1                ; Signal IO sm I/O space access in process
+not_io:
+  out NULL, 3                 ; Skip over clk, and sel<1:0>
+  out y, 2                    ; Get R/WLB, R/WHB bits (inverted, so 00 = read)
+  in y, 32                    ; Push inverted R/WLB, R/WHB to host
+  in pins, 16                 ; Get DALs into ISR<31:15> 
+  in x, 16                    ; Combine with with upper bits, send to host
+
+// Shared with bus_io SM
+public wait_pi:
+  wait 1 pin T11_PI_PIN       ; Wait for PI assertion
+  jmp !y, rd_op               ; R/WLB, HB zeros, must be a read
+
+wr_op:
+public bus_io_wrap:
+  in pins, 32                 ; Get DALs into ISR<31:0> for write
+// End shared with bus_io SM
+.wrap
+
+iack_op:
+  irq nowait 0                ; Signal IACK SM
+  jmp start                   ; Done with this cycle
+
+// Send I/O transactions to RP2350.
+// Run by bus_io SM
+public bus_io_wrap_target:
+public bus_io_start:
+  wait 1 IRQ 1                ; Wait for bus op SM to signal I/O transaction
+  in pins, 32                 ; Send data to RP2350
+  jmp wait_pi                 ; Jump to shared bus_op code 
+
+
+// Watch for bclr, put mode register on DALs when asserted
+// Register X preloaded with T11 mode value
+// Out pins mapped to DAL
+
+.program bus_bclr
+ .origin 24
+
+done_mode:
+  mov pindirs, NULL           ; Make DALs input
+
+public start:
+  jmp pin, start              ; Wait for bclr to go low
+
+.wrap_target
+send_mode:
+  mov pins, x                 ; Put mode register on pins
+  mov pindirs, ~NULL          ; Make DALs output
+  jmp pin, done_mode          ; Do until bclr goes high
+.wrap
+
+// Do T11 IACK transaction:
+// 1) Send interrupt request from RP2350
+// 2) Wait for IACK from T11
+// 3) Send interupt vector to T11
+// IACK FIFO contains:
+// <31:16> - Interrupt vector. (T11 uses only DAL<7:2>, so only <23:18>)
+// <15:00> - Set instruction to generate T11 IRQ request. E.g.:
+//           set pio_pins, 0b1110 to generate IRQ priority 4
+.program bus_iack
+.side_set 4 opt
+
+.define T11_DAL0_PIN 19
+.define T11_SEL1_PIN  (36 - T11_DAL0_PIN)
+.define T11_RAS_PIN (40 - T11_DAL0_PIN)
+
+  .origin 30
+public iack_wrap_target:
+public start:
+  out exec, 16 side 0b1111      ; Exec set instruction to generate IRQ bits
+  wait 1 IRQ 0                  ; Wait for bus op SM to signal IACK
+// Following instructions are now done as part of rd_op via PC wrap around to 0
+// Note that wrap and wrap target are set explicitly via sm_config_set_wrap()
+//  mov pindirs, ~NULL          ; Make DAL output
+//  out pins, 16                ; Send vector
+
+% c-sdk {
+
+%}

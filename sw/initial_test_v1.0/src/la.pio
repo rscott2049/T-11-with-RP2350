@@ -1,0 +1,511 @@
+// Logic analyzer program for T-11 emulator
+
+.program la
+.define T11_RAS_PIN (40 - 19)
+.define T11_CAS_PIN (41 - 19)
+.define T11_PI_PIN  (42 - 19)
+.define T11_CLK_PIN (35 - 19)
+/*
+public start:
+.wrap_target
+  wait 1 pin T11_RAS_PIN
+  wait 0 pin T11_RAS_PIN
+  in pins, 32
+.wrap
+*/
+
+send:
+   in pins, 32           ; send bus to host
+   mov y, x              ; save controls for next test
+public start:
+.wrap_target
+   mov OSR, pins           ; Get DALs and controls
+   out NULL, (T11_RAS_PIN) ; Get to RAS
+   out x, 3                ; Get RAS/CAS/PI
+   jmp x!=y, send          ; If different, send to host
+.wrap                      ; Else, scan again
+
+% c-sdk {
+
+// Allocate PIO and SMs for logic analyzer PIO program
+PIO pio_la;
+uint sm_la;
+int offset_la;
+uint32_t la_dma_chan;
+dma_channel_config la_cfg;
+// Set buffer size
+#define LA_BUF_POW 11
+#define LA_BUF_POW_BYTES (LA_BUF_POW + 2)
+#define LA_BUF_SIZE (1 << LA_BUF_POW)
+#define LA_BUF_SIZE_BYTES (1 << LA_BUF_POW_BYTES)
+uint32_t la_buf[LA_BUF_SIZE] __attribute__((aligned(LA_BUF_SIZE_BYTES)));
+
+uint32_t *get_fifo_rx_addr_la(PIO pio, uint sm) {
+
+  if (pio == pio0) return (uint32_t *)&pio0->rxf[sm];
+  else if (pio == pio1) return (uint32_t *)&pio1->rxf[sm];
+  else if (pio == pio2) return (uint32_t *)&pio2->rxf[sm];
+
+  return 0;
+}
+
+uint32_t la_program_init() {
+
+  // Get base PIO and SM
+  bool s_status = pio_claim_free_sm_and_add_program_for_gpio_range 
+    (&la_program, &pio_la, &sm_la, &offset_la,
+     T11_DAL0_PIN, 47 - T11_DAL0_PIN, true);
+
+  pio_sm_config c = la_program_get_default_config(offset_la);
+
+  // Enable reading data and bus status
+  sm_config_set_in_pins(&c, T11_DAL0_PIN);
+  sm_config_set_in_pin_count(&c, 31);
+
+  // Make RX FIFO 8 entries
+  sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+  // Set bclr pin as jump pin
+  sm_config_set_jmp_pin(&c, T11_BCLR_PIN); 
+
+  // Use system clock as PIO clock
+  float div = 1.0f;
+  sm_config_set_clkdiv(&c, div);
+
+  // Set input FIFO shift right, auto push enabled, 32 bit threshold
+  sm_config_set_in_shift(&c, true, true, 32);
+
+  uint32_t la_start_addr = offset_la + la_offset_start;
+  uint32_t results = pio_sm_init(pio_la, sm_la, la_start_addr, &c);
+
+  if (results) {
+    printf("LA: failed to init\n");
+    return -1;
+  }
+
+  // Get DMA channel
+  la_dma_chan = dma_claim_unused_channel(true);
+  la_cfg = dma_channel_get_default_config(la_dma_chan);
+
+  // Read from RX FIFO
+  channel_config_set_dreq(&la_cfg, pio_get_dreq(pio_la, sm_la, false));
+
+  // Read from LA FIFO, write to sample ring buffer
+  channel_config_set_read_increment(&la_cfg, false);
+  channel_config_set_write_increment(&la_cfg, true);
+
+  // Wrap sample buffer write pointer on ring byte boundary 
+  channel_config_set_ring(&la_cfg, true, LA_BUF_POW_BYTES); 
+
+  // Get fifo read port address
+  uint32_t* rx_fifo_addr = get_fifo_rx_addr_la(pio_la, sm_la);
+
+  // Write config and enable to start when RX_FIFO has data
+  dma_channel_configure(
+			la_dma_chan,
+			&la_cfg,
+			(void *)(la_buf),   // Write addr
+			(void *)rx_fifo_addr,    // Read addr
+			LA_BUF_SIZE,             // One buffer 
+			true                     // Start with RX_DATA present
+			);
+
+  // Start SM
+  pio_sm_set_enabled(pio_la, sm_la, true);
+
+  return 0;
+}
+
+
+uint32_t get_pin(uint32_t bus, uint32_t pin) {
+  return ((bus >> (pin - T11_DAL0_PIN)) & 1);
+}
+
+int get_field(uint32_t bus, uint32_t pin, uint32_t mask) {
+  return ((bus >> (pin - T11_DAL0_PIN)) & mask);
+}
+
+void print_bus(uint32_t bus) {
+#if 0
+  printf("pi/r/c/sel0: %d %d %d %d\n",
+	 get_pin(bus, T11_PI_PIN),
+	 get_pin(bus, T11_RAS_PIN),
+	 get_pin(bus, T11_CAS_PIN),	 
+	 get_pin(bus, T11_SEL0_PIN));	 
+#endif
+  printf("INT: %02x ", get_field(bus, T11_CP3_PIN, 0x1f));
+  uint8_t r_c = get_pin(bus, T11_RAS_PIN) ? 'R' : 'r';
+  uint8_t c_c = get_pin(bus, T11_CAS_PIN) ? 'C' : 'c';
+  uint8_t p_c = get_pin(bus, T11_PI_PIN) ? 'P' : '_';
+  printf("%c %c %c ", r_c, c_c, p_c);
+  
+  printf("sel: %d rw: %d ", 
+	 get_field(bus, T11_SEL1_PIN, 0x3),
+	 get_field(bus, T11_RWHB_PIN, 0x3));
+
+  printf("DAL: %04x %04o\n", get_field(bus, T11_DAL0_PIN, 0xffff),
+	 get_field(bus, T11_DAL0_PIN, 0xffff));
+
+}
+
+
+// Look for instructions from LA capture buf
+int32_t an_bus(uint32_t index) {
+  uint32_t bus;
+  uint32_t sel;
+  uint16_t addr;
+  uint16_t data;
+
+  while(1) {
+    // Get current transaction 
+    bus = la_buf[index++];
+    // Test if fetch transaction
+    sel = get_field(bus, T11_SEL1_PIN, 0x3);
+    if (sel == 0x2) {
+      addr = get_field(bus, T11_DAL0_PIN, 0xffff);
+      // Find PI assertion
+      for (int i = 0; i < 10; i++) {
+	index = index + 1;
+	if (get_pin(la_buf[index], T11_PI_PIN)) {
+	  // Get data at PI assertion + 1
+	  index++;
+	  data = get_field(la_buf[index], T11_DAL0_PIN, 0xffff);
+	  break;
+	}
+	if (i == 9) return -2;
+      }
+
+      data = get_field(la_buf[index], T11_DAL0_PIN, 0xffff);
+      printf("%3d PC/Inst: %04x %04x %06o %06o\n",
+	     index, addr, data, addr, data);
+      index++;
+      return index;
+    }	     
+    if (index > LA_BUF_SIZE) return -1;
+  }
+}
+
+
+// Logic analyser functions
+// From google AI search
+ 
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+
+// Helper to format PDP-11 addressing modes
+// Returns the number of additional words consumed (0 or 1)
+int format_operand(uint8_t mode, uint8_t reg, uint16_t next_word, char *buffer) {
+    switch (mode) {
+        case 0: // Register
+            sprintf(buffer, "R%d", reg);
+            return 0;
+        case 1: // Register deferred
+            sprintf(buffer, "(R%d)", reg);
+            return 0;
+        case 2: // Autoincrement
+            if (reg == 7) { // PC immediate
+                sprintf(buffer, "#%06o", next_word);
+                return 1;
+            }
+            sprintf(buffer, "(R%d)+", reg);
+            return 0;
+        case 3: // Autoincrement deferred
+            if (reg == 7) { // PC absolute
+                sprintf(buffer, "@#%06o", next_word);
+                return 1;
+            }
+            sprintf(buffer, "@(R%d)+", reg);
+            return 0;
+        case 4: // Autodecrement
+            sprintf(buffer, "-(R%d)", reg);
+            return 0;
+        case 5: // Autodecrement deferred
+            sprintf(buffer, "@-(R%d)", reg);
+            return 0;
+        case 6: // Index
+            if (reg == 7) { // PC relative
+                sprintf(buffer, "%06o", next_word); // Simplified representation
+                return 1;
+            }
+            sprintf(buffer, "%06o(R%d)", next_word, reg);
+            return 1;
+        case 7: // Index deferred
+            if (reg == 7) { // PC relative deferred
+                sprintf(buffer, "@%06o", next_word);
+                return 1;
+            }
+            sprintf(buffer, "@%06o(R%d)", next_word, reg);
+            return 1;
+        default:
+            sprintf(buffer, "???");
+            return 0;
+    }
+}
+
+// Disassembles a single instruction
+// Returns the total number of 16-bit words consumed by this instruction
+ int disassemble_pdp11(uint16_t pc, uint16_t *words, char *out_str) {
+   uint16_t opcode = words[0];
+    
+   // Extract common bitfields
+   uint8_t src_mode = (opcode >> 9) & 0x7;
+   uint8_t src_reg  = (opcode >> 6) & 0x7;
+   uint8_t dst_mode = (opcode >> 3) & 0x7;
+   uint8_t dst_reg  = opcode & 0x7;
+   uint8_t reg_only = (opcode >> 6) & 0x7;
+    
+   char src_buf[32] = {0};
+   char dst_buf[32] = {0};
+   int words_consumed = 1;
+
+   // 1. Double Operand Instructions (MOV, ADD, SUB, CMP, BIT, BIC, BIS)
+   uint16_t op4 = opcode >> 12;
+   if (op4 >= 01 && op4 <= 06) {
+     const char *ops[] = {"", "MOV", "CMP", "BIT", "BIC", "BIS", "ADD"};
+     words_consumed += format_operand(src_mode, src_reg, words[words_consumed], src_buf);
+     words_consumed += format_operand(dst_mode, dst_reg, words[words_consumed], dst_buf);
+     sprintf(out_str, "%s %s, %s", ops[op4], src_buf, dst_buf);
+     return words_consumed;
+   }
+
+   // Byte mode double operand instructions (except for SUB, which word only)
+   if (op4 >= 011 && op4 <= 016) {
+     const char *ops[] = {"", "MOVB", "CMPB", "BITB", "BICB", "BISB", "SUB"};
+     words_consumed += format_operand(src_mode, src_reg, words[words_consumed], src_buf);
+     words_consumed += format_operand(dst_mode, dst_reg, words[words_consumed], dst_buf);
+     sprintf(out_str, "%s %s, %s", ops[op4], src_buf, dst_buf);
+     return words_consumed;
+   }
+
+
+   /*
+   if (op4 == 016) { // SUB instruction (016NNN)
+     words_consumed += format_operand(src_mode, src_reg, words[words_consumed], src_buf);
+     words_consumed += format_operand(dst_mode, dst_reg, words[words_consumed], dst_buf);
+     sprintf(out_str, "SUB %s, %s", src_buf, dst_buf);
+     return words_consumed;
+   }
+   */
+
+   // 2. Single Operand Instructions (CLR, COM, INC, DEC, NEG, TST, JMP, etc.)
+   uint16_t op10 = opcode >> 6;
+   if (op10 == 0001) { // JMP
+     words_consumed += format_operand(dst_mode, dst_reg, words[words_consumed], dst_buf);
+     sprintf(out_str, "JMP %s", dst_buf);
+     return words_consumed;
+   }
+   if (op10 == 0050) { // CLR
+     words_consumed += format_operand(dst_mode, dst_reg, words[words_consumed], dst_buf);
+     sprintf(out_str, "CLR %s", dst_buf);
+     return words_consumed;
+   }
+   if (op10 == 0057) { // TST
+     words_consumed += format_operand(dst_mode, dst_reg, words[words_consumed], dst_buf);
+     sprintf(out_str, "TST %s", dst_buf);
+     return words_consumed;
+   }
+
+   // 3. Branches (BR, BNE, BEQ, BPL, BMI, etc.)
+   uint8_t op8 = opcode >> 8;
+   if (op8 >= 040 && op8 <= 047) {
+     const char *branches[] = {"BR", "BNE", "BEQ", "BGE", "BLT", "BGT", "BLE"};
+     int8_t offset = (int8_t)(opcode & 0xFF); // 8-bit signed offset
+     uint16_t target = pc + 2 + (offset * 2);
+     sprintf(out_str, "%s %06o", branches[op8 - 040], target);
+     return 1;
+   }
+
+   // 4. RTS / Misc / Control Instructions
+   if ((opcode & 0xFFF8) == 000200) { // RTS
+     sprintf(out_str, "RTS R%d", dst_reg);
+     return 1;
+   }
+   if (opcode == 000000) {
+     sprintf(out_str, "HALT");
+     return 1;
+   }
+
+   if (opcode == 000001) {
+     sprintf(out_str, "WAIT");
+     return 1;
+   }
+
+   if (opcode == 000002) {
+     sprintf(out_str, "RTI");
+     return 1;
+   }
+
+
+   if (opcode == 000003) {
+     sprintf(out_str, "BPT");
+     return 1;
+   }
+
+   if (opcode == 000005) {
+     sprintf(out_str, "RESET");
+     return 1;
+   }
+
+   if (opcode == 000006) {
+     sprintf(out_str, "RTT");
+     return 1;
+   }
+
+   if (opcode == 000007) {
+     sprintf(out_str, "MFPT");
+     return 1;
+   }
+
+
+   // Fallback for unhandled/unknown opcodes
+   sprintf(out_str, "WORD %06o", opcode);
+   return 1;
+ }
+
+// Struct representing a single line from your hardware bus trace
+ typedef struct {
+   uint16_t addr;      // Bus Address (Octal)
+   uint16_t data;      // Data word on the bus (Octal)
+   bool is_write;      // true = Write (DATO/DATOB), false = Read (DATI/DATIP)
+   bool is_fetch;      // true = CPU Fetch Signal active (New instruction start)
+ } TraceLine;
+
+
+ // Parses the trace log stream
+ void parse_trace_with_fetch(TraceLine *trace, int trace_length) {
+   char disasm_buf[128];
+   uint16_t inst_window[3]; // Max size of a PDP-11 instruction is 3 words
+
+   for (int i = 0; i < trace_length; i++) {
+     // Trigger disassembly ONLY when the hardware fetch signal is asserted
+     if (trace[i].is_fetch) {
+       uint16_t current_pc = trace[i].addr;
+            
+       // 1. Grab the base opcode
+       inst_window[0] = trace[i].data;
+            
+       // 2. Look ahead in the trace to grab extension words (operands / constants)
+       // We look for subsequent READ cycles that are NOT new fetches.
+       int window_idx = 1;
+       int lookahead = i + 1;
+            
+       while (window_idx < 3 && lookahead < trace_length) {
+	 // If we hit another FETCH or a WRITE, we stop gathering extension words
+	 if (trace[lookahead].is_fetch || trace[lookahead].is_write) {
+	   break;
+	 }
+                
+	 // This is an intermediate read cycle (index offset, absolute address, etc.)
+	 inst_window[window_idx++] = trace[lookahead].data;
+	 lookahead++;
+       }
+
+       // 3. Decode the instruction using our execution window
+       disassemble_pdp11(current_pc, inst_window, disasm_buf);
+            
+       // 4. Print clean disassembly output matching the trace address
+       printf("PC: %06o | Inst: %06o | %s\n", current_pc, inst_window[0], disasm_buf);
+     } 
+     else {
+       // (Optional) Log or track data read/write modifications here
+       if (trace[i].is_write) {
+	 printf("  [Data Write] Addr: %06o -> Value: %06o\n", trace[i].addr, trace[i].data);
+       }
+     }
+   }
+ }
+
+
+
+ // Glue code to feed the above
+
+ // Format LA buffer to feed above
+ TraceLine tr_la_buf[LA_BUF_SIZE];
+
+ uint32_t init_pc = -1;
+
+ uint32_t la_tr_format() {
+
+   uint32_t bus;
+   uint32_t sel;
+   uint32_t rw;
+
+   uint32_t index = 0;
+   uint32_t i = 0;
+   uint32_t j = 0;
+
+   while (i < LA_BUF_SIZE) {
+     // Get sample
+     bus = la_buf[i++];
+
+     // Skip until RAS asserted (0)
+     if (get_pin(bus, T11_RAS_PIN)) continue;
+
+     // Get address
+     tr_la_buf[index].addr = get_field(bus, T11_DAL0_PIN, 0xffff);
+
+     // Test if fetch or data, save results
+     sel = get_field(bus, T11_SEL1_PIN, 0x3);
+     tr_la_buf[index].is_fetch = (sel == 0x2);
+
+     // Save first fetch address as initial program counter
+     if ((sel == 0x2) && (init_pc == -1)) init_pc = tr_la_buf[index].addr;
+
+     // Test if read or write, save results
+     rw = get_field(bus, T11_RWHB_PIN, 0x3);
+     tr_la_buf[index].is_write = (rw != 0x3);
+
+     // Find PI assertion
+     j = 9;
+     while(get_pin(la_buf[i++], T11_PI_PIN) == 0) {
+       j--;
+       // Don't go beyond sample buf
+       if (i > LA_BUF_SIZE) j = 0;
+       // No PI, must be last sample
+       if (j == 0) break;
+     }
+
+     // No PI assertion found, must be end of good samples
+     if (j == 0) {
+       return index;
+     } else {
+       // Complete the sample, advance tr_buf sample count
+       // Capture data after PI assertion
+       tr_la_buf[index].data = get_field(la_buf[i++], T11_DAL0_PIN, 0xffff);
+       index++;
+     }
+
+     // Advance to RAS deassertion to finish bus cycle
+     j = 9;
+     while(get_pin(la_buf[i++], T11_RAS_PIN) == 0) {
+       j--;
+       // Don't go beyond sample buf
+       if (i > LA_BUF_SIZE) j = 0;
+       // No RAS deassertion, must be last sample
+       if (j == 0) return index;
+     }
+
+   }
+   return index;
+ }
+
+ // Disassemble an LA buffer
+ uint32_t dis_buf() {
+
+   // Format trace buffer
+   uint32_t tr_count = la_tr_format();
+   
+   printf("tr_count: %d\n", tr_count);
+
+   // Disassemble
+   parse_trace_with_fetch(tr_la_buf, tr_count);
+
+   return 0;
+ }
+
+
+%}
+
+  
