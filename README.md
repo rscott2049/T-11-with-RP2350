@@ -85,17 +85,10 @@ Build steps:
 3) cmake -B build -S .
 4) make -C build -j
 
-
-
 ### 3.2.2 Booting RT-11
 1) Get an RK05 RT-11 disk image, copy to a micro SD card with a name of
 rk0.dsk, insert card into the microSD card slot on the board.
-1) cd to sw/initial_test_v1.0
-2) Make a soft link to your installation of no-OS-FatFS-SD-SDIO-SPI-RPi-Pico.
-3) cmake -B build -S .
-4) make -C build -j
-5) Start open-ocd and load initial_test.elf onto the board
-5) Start open-ocd and load initial_test.elf onto the board
+2) Start open-ocd and load initial_test.elf onto the board, and start it. RT-11 should then boot.
 
 ## 4.0) Techniques of interest:
 ### 4.1) PIO
