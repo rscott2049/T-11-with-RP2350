@@ -15,10 +15,10 @@ provides the interval.
 the T-11.
 3) RK11 - 2.5 MB disk drive. This is mapped to a file on a micro SD card, using
 the SDIO/FatFS libary.
-4) M9312 - console and boot ROM card. Slighly modified PDP-11 boot ROM and
+4) M9312 - console and boot ROM card. Slightly modified PDP-11 boot ROM and
 standard RK boot code storage is emulated.
 
-## 1.1 Backround
+## 1.1 Background
 
 The T-11 as Digital's first single chip PDP-11, and was intended for commercial
 board designs. As such, it was used for DEC products such as the VT240 terminal
@@ -27,7 +27,7 @@ the Paperboy video arcade console is one example.
 
 ## 1.2 Motivation
 
-I started with DEC right out of colledge, working for the Semicondutor
+I started with DEC right out of college, working for the Semiconductor
 Engineering Group in Hudson, MA. My first assignment was supporting the T-11,
 including design reviews, documentation, etc., so this project was a great way
 to re-visit that part of my career. 
@@ -37,11 +37,11 @@ to re-visit that part of my career.
 The RP2350 is fast enough to provide full speed memory to the T-ll with
 the use of PIO and DMA. Currently, the design uses about 50 clocks to provide
 8/16 bit memory reads and writes using four DMA channels and one PIO instance
-with it's four state machines. In addtion to supporting memory, the other state
+with it's four state machines. In addition to supporting memory, the other state
 machines provide interrupt cycle support, T-11 mode register loading,
 and forwarding of I/O requests to the RP2350 processor. The latter facility
 copies I/O page memory requests to a dedicated FIFO so that the RP2350 can be
-interrupted when I/O occurrs.
+interrupted when I/O occurs.
 
 ## 2.1 I/O
 
@@ -51,9 +51,9 @@ the request. Simultaneously, another PIO engine pushes the address and data
 to a PIO FIFO so that the RP2350 can update the affected I/O locations.
 For instance, a T-11 read of the DL11 UART receive buffer must return the
 RX buffer, and also clear the RX ready flag. So, the PIO/DMA machine will
-return the emulated RX buffer contents, and I/O PIO machine witll trigger
+return the emulated RX buffer contents, and I/O PIO machine will trigger
 the RP2350 service routine to clear the RX ready flag. (Of course, there
-is an implicit excution time limit: the flag must be cleared faster than
+is an implicit execution time limit: the flag must be cleared faster than
 the T-11 can read the next memory location). In general, simple side effects
 can be handled in a RP2350 interrupt service routine, while longer operations
 must be handled by an event loop running at normal priority. Emulation of disk
@@ -107,9 +107,9 @@ made this a test for zero (read), or write (everything else).
 via PIO instructions.
 3) Use the wrap registers to jump in and out of other PIO engine code. This
 allows zero overhead code sharing. However, the same code must be loaded
-into the PIO statemachines so that targets can be shared between them.
+into the PIO state machines so that targets can be shared between them.
 4) Use IRQ flags to signal another PIO SM with different pin maps to
-support particular T11 transactions. E.g. the IACK trasaction simulatenously
+support particular T11 transactions. E.g. the IACK transaction simultaneously
 reads the interrupt vector on DAL<7:2>, while acknowledging the interrupt
 on DAL<15:08>, thus requiring outputs only on the lower byte. To avoid
 extra PIO instructions for manipulating the direction register, we configure
@@ -125,7 +125,7 @@ set of instructions. The first attempt at dispatching device emulators
 resulted in a maximum T-11 speed of 3.5 MHz, due to the amount of
 time needed to determine if the address was a device to be emulated or
 not. Converting the serial execution of successive compares to a table of
-functiond dispatched via the I/O address allowed the T-11 to operate at
+functions dispatched via the I/O address allowed the T-11 to operate at
 full speed. (Though a further, not yet fixed, bug in the disk emulation
 limits speed to 7.3 MHz).
 2) Use of the second core for capturing T-11 bus transactions is very
@@ -148,7 +148,7 @@ cases, but it's not perfect.
 The RL emulation still has a bug: a race condition between the interrupt
 servicing the registers, and the main line code performing the actual
 disk operations. I'm not certain where the race conditions is, but
-better seperation between the ISR's version of the command register and
+better separation between the ISR's version of the command register and
 the main line's might be the solution. I'm also suspicious of the RK
 emulator, as it breaks when the T-11 is run at full speed. As far as I
 can tell, there's no hardware reason that prevents this.
@@ -158,7 +158,7 @@ Amazed when the OS actually booted! Here's the first boot log entry:
 4-oct-2026:
 
 Thought about NXM generation: should only need to assert halt for reads, as
-writes are always preceeded by a read. Also, should count NXM services to
+writes are always preceded by a read. Also, should count NXM services to
 make sure they match with generated requests.
 
 So, before eliminating write NXM
@@ -208,13 +208,13 @@ Bottom line:
 write operations that make up a T-11 write transaction.
 
 Note:
-Scope shows about 100ns from RAS rising to deassertion of HALT request.
+Scope shows about 100ns from RAS rising to de-assertion of HALT request.
 Removing the wait for RAS rising edge removes the delay. So, it takes
 100ns to detect and act upon an edge in C. Keep that in mind...
 
 Also, it takes 630ns to determine if NXM halt should be asserted or not.
 This is pretty much an entire RAS low time at 7.5 MHz, so we miss the
-deassertion of RAS and keep halt asserted. Not good. Operating at 3.75 for
+de-assertion of RAS and keep halt asserted. Not good. Operating at 3.75 for
 now...
 
 Onwards.
@@ -270,7 +270,7 @@ RKDA:   004327 lba:   1699 000006a3
 So that's interesting: when we bang on the kb, interesting things happen.
 
 So, thought about this for a bit. Realized that we hadn't quite emulated
-correct TX IE enable behavoir: viz - if the interrupt is enabled from not
+correct TX IE enable behavior: viz - if the interrupt is enabled from not
 enabled, and the buffer is empty, then we should generate a TX IRQ immediately.
 Added:
 
@@ -405,7 +405,7 @@ Have to make a race condition proof ISR/main handlers.
 ### Add lights and switches register
 Use a PIO instance to drive WS2811 based front panel display. May require a
 sysgen to activate, based on the RT-11v4 sysgen questions.
-### Add ethenet support
+### Add ethernet support
 There is a M9312 Ethernet boot ROM, so that could serve as a starting point
 for test code.
 ### See how hard GT-40 would be to emulate
